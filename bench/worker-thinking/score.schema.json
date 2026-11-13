@@ -1,0 +1,11 @@
+{
+	"type": "object",
+	"properties": {
+		"score": { "type": "number", "minimum": 0, "maximum": 10 },
+		"blockers": { "type": "integer", "minimum": 0 },
+		"shouldFix": { "type": "integer", "minimum": 0 },
+		"summary": { "type": "string" }
+	},
+	"required": ["score", "blockers", "shouldFix", "summary"],
+	"additionalProperties": false
+}

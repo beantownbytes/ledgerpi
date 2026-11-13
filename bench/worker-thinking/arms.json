@@ -1,0 +1,55 @@
+{
+	"manager": "ollama-cloud/deepseek-v4.1-flash:cloud",
+	"callTimeoutMs": 1800000,
+	"gateTimeoutMs": 480000,
+	"arms": [
+		{
+			"id": "c-high-32k",
+			"stage": 1,
+			"worker": "cerebras/qwen-3.8-27b",
+			"thinking": "high",
+			"maxTokens": 32768,
+			"baseline": true
+		},
+		{
+			"id": "c-medium-32k",
+			"stage": 1,
+			"worker": "cerebras/qwen-3.8-27b",
+			"thinking": "medium",
+			"maxTokens": 32768,
+			"baseline": false
+		},
+		{
+			"id": "c-high-41k",
+			"stage": 1,
+			"worker": "cerebras/qwen-3.8-27b",
+			"thinking": "high",
+			"maxTokens": 40960,
+			"baseline": false
+		},
+		{
+			"id": "b-high-32k",
+			"stage": 2,
+			"worker": "local-router/qwen3.8-27b",
+			"thinking": "high",
+			"maxTokens": 32768,
+			"baseline": true
+		},
+		{
+			"id": "b-medium-32k",
+			"stage": 2,
+			"worker": "local-router/qwen3.8-27b",
+			"thinking": "medium",
+			"maxTokens": 32768,
+			"baseline": false
+		},
+		{
+			"id": "b-high-65k",
+			"stage": 2,
+			"worker": "local-router/qwen3.8-27b",
+			"thinking": "high",
+			"maxTokens": 65536,
+			"baseline": false
+		}
+	]
+}

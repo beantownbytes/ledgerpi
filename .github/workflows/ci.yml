@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container:
+      image: node:22-trixie
+    steps:
+      - uses: actions/checkout@v4
+      - name: install host deps
+        run: apt-get update && apt-get install -y --no-install-recommends make build-essential git ca-certificates curl jq
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: make bootstrap
+      - run: make check
+      - run: make build

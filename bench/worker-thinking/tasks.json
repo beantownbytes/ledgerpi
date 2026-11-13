@@ -1,0 +1,66 @@
+{
+	"tasks": [
+		{
+			"id": "incident-1",
+			"kind": "incident",
+			"repo": "example-app",
+			"base": "1111111111111111111111111111111111111111",
+			"branch": "incident-1-fix",
+			"originalCwd": "/path/to/original/worktree-1",
+			"ledgerDir": "00000000-0000-7000-8000-000000000001/1700000000001-00000001",
+			"gate": "make check",
+			"finalGate": "make check-all"
+		},
+		{
+			"id": "incident-2",
+			"kind": "incident",
+			"repo": "example-app",
+			"base": "2222222222222222222222222222222222222222",
+			"branch": "incident-2-fix",
+			"originalCwd": "/path/to/original/worktree-2",
+			"ledgerDir": "00000000-0000-7000-8000-000000000002/1700000000002-00000002",
+			"gate": "make check"
+		},
+		{
+			"id": "incident-3",
+			"kind": "incident",
+			"repo": "example-lib",
+			"base": "3333333333333333333333333333333333333333",
+			"branch": "incident-3-fix",
+			"originalCwd": "/path/to/original/worktree-3",
+			"ledgerDir": "00000000-0000-7000-8000-000000000003/1700000000003-00000003",
+			"setup": "make bootstrap",
+			"gate": "make check"
+		},
+		{
+			"id": "incident-4",
+			"kind": "incident",
+			"repo": "example-infra",
+			"base": "4444444444444444444444444444444444444444",
+			"branch": "incident-4-fix",
+			"originalCwd": "/path/to/original/worktree-4",
+			"ledgerDir": "00000000-0000-7000-8000-000000000004/1700000000004-00000004",
+			"gate": "python3 -m unittest discover -s scripts -p 'test_*.py' && find . -name '*.sh' -not -path './.git/*' -exec bash -n {} \\;"
+		},
+		{
+			"id": "control-1",
+			"kind": "control",
+			"repo": "example-app",
+			"base": "1111111111111111111111111111111111111111",
+			"branch": "control-1-fix",
+			"originalCwd": "/path/to/original/worktree-5",
+			"ledgerDir": "00000000-0000-7000-8000-000000000005/1700000000005-00000005",
+			"gate": "make check"
+		},
+		{
+			"id": "control-2",
+			"kind": "control",
+			"repo": "example-app",
+			"base": "2222222222222222222222222222222222222222",
+			"branch": "control-2-fix",
+			"originalCwd": "/path/to/original/worktree-6",
+			"ledgerDir": "00000000-0000-7000-8000-000000000006/1700000000006-00000006",
+			"gate": "make check"
+		}
+	]
+}

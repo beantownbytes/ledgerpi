@@ -1,0 +1,88 @@
+# ledgerpi config. Copy to ~/.config/ledgerpi/config.toml.
+#
+# Required: on pi, without a config file that names at least one provider, ledgerpi
+# is INERT -- every input and every ledger_solve call passes straight through. Under
+# Claude Code the [claude] table is the opt-in instead. There is no built-in provider
+# fallback.
+
+enabled = true
+
+# Provider ids the loop runs under. A frontier cloud provider is deliberately off
+# by default; the paper's gains are a local-small-model effect.
+providers = ["cerebras", "local", "intranet", "nvidia"]
+
+# Optional operational overrides; each falls back to its default when omitted.
+# gate = ""                 # explicit test command, for every repo; unset auto-detects it (.ledgerpi-gate, Makefile test, manifest)
+# maxIters = 8
+# workerThinking = "high"
+# managerThinking = "high"
+# classifier = true
+# trigger = "ask"           # "ask" confirms each coding prompt; "auto" runs without asking; "manual" only via /ledger or ledger_solve
+# autoTrigger = "off"       # "redirect" blocks the first inline edit in a skill/slash session and routes it through ledger_solve
+# redirectSkills = ["review-task"]  # slash commands "redirect" arms for; empty arms nothing, ["*"] arms all
+# callTimeoutMs = 300000
+# gateTimeoutMs = 180000
+# notesMaxChars = 8000
+# planMaxChars = 4000        # caps the manager's own plan; a plan supplied through plan_file is kept whole
+
+# Concurrent workers, off by default. "advise" has the manager recommend serial,
+# best-of-n or fleet each round and records it, but still runs one worker. "ask" asks
+# you before each round the manager marks best-of-n (yes/no for this round or for the
+# rest of the run); with no way to ask (headless, ledger_solve without a UI, ledgerctl
+# or Claude Code) the round runs serially. "on" runs a round the manager marks
+# best-of-n as up to fanoutMax workers at once in candidate git worktrees, keeping the
+# first whose gate passes, without asking; both need a gate, and a fleet recommendation
+# still runs serially. A per-call fanout on ledger_solve or ledgerctl solve --fanout can
+# only lower this (off < advise < ask < on), never raise it.
+# fanout = "off"
+# fanoutMax = 2              # workers per best-of-n round: an integer from 2 to 8, else warns and uses 2
+
+# Durable audit log: one JSON row per completed run (and per classifier
+# passthrough), for a periodic review of the loop's convergence, token cost, and
+# per-model behavior. Defaults to `runs.jsonl` under stateDir; set an absolute
+# path to relocate it (e.g. onto a persistent host mount so the log survives the box).
+# auditLog = ""
+
+# Per-session-model role pins. Each entry names both the manager and the worker
+# the roles spawn on, as "provider/modelId"; every session-model key must be
+# quoted, while the reserved "default" key below is written bare. A present
+# table without a reserved "default" (even an empty one) narrows activation to
+# the session models it lists, so an allowlisted model with no entry passes
+# through. The reserved "default" entry names at least one role as the fallback
+# for session models with no entry, and its presence re-widens activation to
+# every allowlisted model.
+# [roleModel]
+# "remote/qwen3.8-flash-next" = { manager = "remote/qwen3.8-flash-next", worker = "local/qwen3.8-27b" }
+# default = { worker = "local/qwen3.8-27b" }
+
+# Deprecated alias of [roleModel] that pins only the worker; the manager stays on
+# the session model and a [roleModel] entry for the same key wins. Warns at load.
+# [workerModel]
+# "remote/qwen3.8-flash-next" = "local/qwen3.8-27b"
+
+# Output-token cap for worker spawns only, keyed by the model the worker runs on
+# (the [roleModel] or [workerModel] worker, else the session model) and valued by a
+# positive integer. A worker whose model has no entry keeps the model's default cap.
+# A malformed entry is reported and dropped; it never makes the config inert. A model
+# the pi registry does not know is reported at first use and keeps its default cap,
+# and a cap at or above the model's context window warns but still applies. A capped
+# worker is spawned on an explicit model, even when it runs on the session model, so
+# pi-subagents' Model Scope applies to it as to a pinned model and an agent-type
+# `model:` frontmatter no longer picks its model. pi only; the Claude path ignores it.
+# [workerMaxTokens]
+# "local-router/qwen3.8-27b" = 65536
+
+# Claude Code. The table is the opt-in: without it the plugin registers no tool, and
+# an empty table runs the defaults shown. Roles take full claude-* model ids; an alias
+# such as "opus" warns and falls back to the default. pi ignores this table, and a
+# file with this table and no providers keeps pi inert. Top-level enabled = false and
+# LEDGERPI=0 turn off both harnesses.
+# [claude]
+# manager = "claude-opus-5-5"
+# worker = "claude-sonnet-5-5"
+
+# Per-provider model allowlist. A provider above with NO entry here is in scope for
+# every one of its models; a provider WITH an entry is in scope for only the ids
+# listed under its key (an empty entry allows none).
+[allowlist]
+# cerebras = ["gemma-4-31B"]

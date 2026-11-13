@@ -1,0 +1,12 @@
+{
+	"name": "ledgerpi-local",
+	"owner": { "name": "beantownbytes" },
+	"description": "Local marketplace for the ledgerpi Claude Code plugin.",
+	"plugins": [
+		{
+			"name": "ledgerpi",
+			"source": "./",
+			"description": "Ledger-based manager-worker coding loop on native sub-agents, gated on the repo's tests."
+		}
+	]
+}

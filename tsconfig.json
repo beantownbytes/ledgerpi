@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"types": ["node"],
+		"noEmit": true,
+		"allowImportingTsExtensions": true
+	},
+	"include": ["extensions/**/*.ts", "packages/**/*.ts", "test/**/*.ts", "bench/**/*.ts"],
+	"exclude": ["packages/claude/hooks"]
+}

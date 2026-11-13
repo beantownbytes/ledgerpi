@@ -1,0 +1,8 @@
+{
+	"name": "ledgerpi",
+	"version": "0.1.0",
+	"description": "Ledger-based manager-worker coding loop: an Opus manager and Sonnet workers, run as native sub-agents, with the test gate as ground truth.",
+	"author": { "name": "beantownbytes" },
+	"license": "MIT",
+	"keywords": ["orchestration", "manager-worker", "subagents"]
+}
