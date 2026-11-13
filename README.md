@@ -9,6 +9,51 @@ the work is coordinated through a ledger on disk with the repository's own test
 suite as ground truth. You type a request, confirm the loop when asked, and get an
 answer; `/ledger <task>` starts it explicitly.
 
+## Quick start
+
+The loop is inert until a config names the providers it may run under, so every path
+below ends with that step. Requirements and the full option set are under
+[Install](#install) and [Configure](#configure).
+
+**pi** (needs pi, Node.js and git):
+
+```bash
+pi install https://github.com/beantownbytes/ledgerpi
+pi install npm:@tintinweb/pi-subagents
+mkdir -p ~/.pi/agent/agents ~/.config/ledgerpi
+cp ~/.pi/agent/git/github.com/beantownbytes/ledgerpi/extensions/ledgerpi/agents/*.md ~/.pi/agent/agents/
+```
+
+Create `~/.config/ledgerpi/config.toml` with the provider ids from your pi
+`models.json` that the loop may run under:
+
+```toml
+enabled = true
+providers = ["<provider id>"]
+```
+
+Start pi and run `/ledgerpi` to check the status, then `/ledger <task>`.
+
+**Claude Code** (needs npm, bun and git; the plugin drives the `ledgerctl` binary):
+
+```bash
+git clone https://github.com/beantownbytes/ledgerpi
+make -C ledgerpi bootstrap install     # compiles ledgerctl into ~/.local/bin
+claude plugin marketplace add beantownbytes/ledgerpi
+claude plugin install ledgerpi@ledgerpi
+```
+
+Add the opt-in table to `~/.config/ledgerpi/config.toml`:
+
+```toml
+enabled = true
+
+[claude]
+```
+
+Run `ledgerctl status` to confirm the loop is active, then `/ledgerpi:ledger <task>`
+in Claude Code.
+
 ## The idea
 
 The paper measures that scaffold at +23.2 pass@1 over a single call on a local
@@ -440,9 +485,12 @@ classifier, no auto-trigger, and no edit redirect. A run starts from
 
 ```bash
 make bootstrap install    # needs npm and bun; compiles ledgerctl into ~/.local/bin
-claude plugin marketplace add ./packages/claude
-claude plugin install ledgerpi@ledgerpi-local
+claude plugin marketplace add ./
+claude plugin install ledgerpi@ledgerpi
 ```
+
+From GitHub instead of a clone, use `claude plugin marketplace add beantownbytes/ledgerpi`
+(see [Quick start](#quick-start)); `ledgerctl` must still be on PATH.
 
 Then add a `[claude]` table to the config. It is the opt-in: without it the plugin
 registers no tool. `ledgerctl status` reports whether the loop is active and why not.
