@@ -1,6 +1,6 @@
 {
 	"name": "ledgerpi",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"private": true,
 	"description": "Ledger-based manager-worker coding loop for pi and Claude Code: run the arXiv 2608.26480 scaffold with the repository's tests as ground truth.",
 	"keywords": [
