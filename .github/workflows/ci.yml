@@ -19,3 +19,26 @@ jobs:
       - run: make bootstrap
       - run: make check
       - run: make build
+
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: bump the patch version
+        run: scripts/bump-version.sh
+      - name: commit, tag and push
+        run: |
+          version="$(cat VERSION)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION package.json package-lock.json packages/claude/.claude-plugin/plugin.json
+          git commit -m "release: v${version} [skip ci]"
+          git tag "v${version}"
+          git push origin HEAD:main "v${version}"
