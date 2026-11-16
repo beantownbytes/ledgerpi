@@ -106,20 +106,16 @@ types named `ledger-manager` and `ledger-worker` (see
 `[roleModel]` pins both roles per session model, so a fast model can plan and
 review while a stronger one implements. Each entry names both a `manager` and
 a `worker`. With no table at all, an allowlisted session model runs every role on
-the session model, or on its deprecated `[workerModel]` alias for the worker.
-A present table without a reserved `default` also narrows activation to the
-session models it lists (or the deprecated `[workerModel]` alias), so an
-allowlisted model with no entry passes through; with no table, every allowlisted
-model is in scope.
+the session model. A present table without a reserved `default` also narrows
+activation to the session models it lists, so an allowlisted model with no entry
+passes through; with no table, every allowlisted model is in scope.
 
 The reserved `default` key is the fallback for session models the table does not
 name. It may name a `manager` and/or a `worker`, at least one, each a
 `"provider/modelId"`. A default present counts as an activation opt-in, so the
 table stops narrowing: every allowlisted model is in scope again, while the
 worker (and the manager, when named) stays pinned. A named entry wins over the
-default, and the default wins over the session model. A deprecated `[workerModel]`
-alias entry outranks the default too, and takes both roles: an aliased session
-model keeps its manager on the session model even when the default names one.
+default, and the default wins over the session model.
 
 ```toml
 [roleModel]
@@ -135,12 +131,6 @@ be in `enabledModels`, or the spawn is refused and the run stops with
 `stop: "spawn-failure"`. There is no fallback to the session model for a pinned
 model that does not resolve. The hand-off block and the audit row name both role
 models.
-
-`[workerModel]` is a deprecated alias that pins only the worker:
-`"remote/qwen3.8-flash-next" = "local/qwen3.8-27b"` spawns the ideation,
-implementation, and finalize workers on the mapped model and leaves the manager
-on the session model. It still works and warns at config load; a `[roleModel]`
-entry for the same session model wins.
 
 ## Three entry points
 
@@ -246,10 +236,8 @@ worktree or the session cwd), writes a self-contained task from the approved pla
 remaining steps and the current diff, and calls `ledger_solve` with that `cwd`. The
 models are ledgerpi's: the manager on its `[roleModel]` pin when the session
 model has a `[roleModel]` entry, else on the `[roleModel] default` manager, else
-the session model, and the worker on its `[roleModel]` pin, its deprecated
-`[workerModel]` alias, the `[roleModel] default` worker, or the session model. An
-`[workerModel]` alias takes both roles, so an aliased session model keeps its
-manager on the session model even when the default names one.
+the session model, and the worker on its `[roleModel]` pin, the
+`[roleModel] default` worker, or the session model.
 After the hand-off it verifies the diff and the gate, then
 returns to the workflow that was running. If ledgerpi is inactive it stops and
 says so rather than editing inline.
@@ -451,7 +439,7 @@ as recorded in the source named in each row, and a re-run can differ.
 - The agent types `ledger-manager` and `ledger-worker`. Copy
   `extensions/ledgerpi/agents/ledger-manager.md` and `ledger-worker.md` into
   `$PI_CODING_AGENT_DIR/agents` (default `~/.pi/agent/agents`) so they resolve.
-- A model provider. `providers`, `allowlist`, `[roleModel]` and `[workerModel]` name
+- A model provider. `providers`, `allowlist` and `[roleModel]` name
   models as `provider/modelId`, where each provider id is a key of `providers` in pi's
   `models.json`. See [Configure](#configure).
 
@@ -579,9 +567,8 @@ cerebras = ["gemma-4-31B"]   # restrict cerebras to this model; omit the entry t
 | `maxIters` | `8` | Manager to worker round budget. |
 | `workerThinking` | `high` | Thinking level for the worker role. |
 | `managerThinking` | `high` | Thinking level for the manager role. |
-| `roleModel` | `null` (absent) | Per-session-model role pins and activation narrowing: `"provider/modelId" = { manager = "provider/modelId", worker = "provider/modelId" }`. An absent table leaves activation to the provider and allowlist alone; a present table, even an empty one, narrows activation to the session models it lists (plus `[workerModel]` alias entries), and an entry's session model spawns the two roles on the entry's two models. The reserved key `default = { manager = "provider/modelId", worker = "provider/modelId" }` is the fallback pin for session models with no entry: it names at least one of the two roles, and its presence widens activation back to every allowlisted model; a named entry wins over it. A malformed table, entry, or default is reported and dropped (a malformed entry's session model stays inactive); it never makes the config inert. |
-| `workerModel` | `{}` | Deprecated alias of `[roleModel]` that pins only the worker: `"provider/modelId" = "provider/modelId"`. An unmapped session model runs the worker on the `[roleModel] default` worker, or on the session model when the table sets no default; the alias takes both roles, so it also keeps the manager off the default. Warns at load; a `[roleModel]` entry for the same session model wins. A malformed table or entry is reported and dropped; it never makes the config inert. |
-| `workerMaxTokens` | `{}` | Output-token cap for worker spawns only: `"provider/modelId" = <positive integer>`, e.g. `"local-router/qwen3.8-27b" = 65536`. The key is the worker's effective model (the `[roleModel]` or `[workerModel]` worker, else the session model); a worker whose model has no entry keeps the model's default cap, and the manager is never capped. A malformed table or entry (a key that is not `provider/modelId`, a value that is not a positive integer) is reported and dropped; it never makes the config inert. A model the pi registry does not know is reported at first use and the worker keeps its default cap. A cap at or above the model's context window warns but still applies. A capped worker is spawned on an explicit model, even when it runs on the session model, so pi-subagents' Model Scope applies to it as it does to a pinned model (the model must be in `enabledModels` when scope is on) and an agent-type `model:` frontmatter no longer picks its model. pi only; the Claude path ignores it. |
+| `roleModel` | `null` (absent) | Per-session-model role pins and activation narrowing: `"provider/modelId" = { manager = "provider/modelId", worker = "provider/modelId" }`. An absent table leaves activation to the provider and allowlist alone; a present table, even an empty one, narrows activation to the session models it lists, and an entry's session model spawns the two roles on the entry's two models. The reserved key `default = { manager = "provider/modelId", worker = "provider/modelId" }` is the fallback pin for session models with no entry: it names at least one of the two roles, and its presence widens activation back to every allowlisted model; a named entry wins over it. A malformed table, entry, or default is reported and dropped (a malformed entry's session model stays inactive); it never makes the config inert. |
+| `workerMaxTokens` | `{}` | Output-token cap for worker spawns only: `"provider/modelId" = <positive integer>`, e.g. `"local-router/qwen3.8-27b" = 65536`. The key is the worker's effective model (the `[roleModel]` worker, else the session model); a worker whose model has no entry keeps the model's default cap, and the manager is never capped. A malformed table or entry (a key that is not `provider/modelId`, a value that is not a positive integer) is reported and dropped; it never makes the config inert. A model the pi registry does not know is reported at first use and the worker keeps its default cap. A cap at or above the model's context window warns but still applies. A capped worker is spawned on an explicit model, even when it runs on the session model, so pi-subagents' Model Scope applies to it as it does to a pinned model (the model must be in `enabledModels` when scope is on) and an agent-type `model:` frontmatter no longer picks its model. pi only; the Claude path ignores it. |
 | `trigger` | `ask` | How the `input` hook starts the loop on an eligible coding prompt. `ask` shows a Run / Skip / Skip-for-session dialog (print mode, with no UI, passes through; an RPC client receives the dialog and must answer it); `auto` runs without asking; `manual` never runs from the hook and makes no classifier call -- only `/ledger` and `ledger_solve` start runs. |
 | `classifier` | `true` | Whether to run the code-vs-chat classifier. False bypasses classification only: every eligible prompt is treated as code and goes on to `trigger` (asked under `ask`, run under `auto`, never under `manual`); it does not bypass the unconditional continuation-only and escape guards. |
 | `autoTrigger` | `off` | Trigger mode for skill/slash sessions. `redirect` blocks the first inline edit in such a session and steers the model to `ledger_solve`; `off` leaves the tool as the only such path. |
@@ -595,12 +582,11 @@ cerebras = ["gemma-4-31B"]   # restrict cerebras to this model; omit the entry t
 
 Activation is per model: the provider must be in `providers`, the model must be
 permitted by that provider's `[allowlist]` entry, and, under a present
-`[roleModel]` table, the session model must also be listed in that table, listed
-in the deprecated `[workerModel]` alias, or covered by the table's reserved
-`default` entry, which opts every allowlisted model back in. A provider with no
-allowlist entry allows every model; a provider with an entry allows only the ids
-listed, so `cerebras = ["gemma-4-31B"]` runs that model alone and `cerebras = []`
-runs none. An absent `[roleModel]` table adds no further gate.
+`[roleModel]` table, the session model must also be listed in that table or
+covered by the table's reserved `default` entry, which opts every allowlisted
+model back in. A provider with no allowlist entry allows every model; a provider
+with an entry allows only the ids listed, so `cerebras = ["gemma-4-31B"]` runs
+that model alone and `cerebras = []` runs none. An absent `[roleModel]` table adds no further gate.
 
 Config warnings (an unknown key, a malformed table, an inert config) and runtime
 failures (a ledger or audit write, a classifier error) show up as pi notices in
@@ -624,9 +610,8 @@ overrides the config file path for one process. `/ledgerpi` prints status:
 whether the current model is in scope (or not on its provider's allowlist, or the
 config is inert, or, under a present `[roleModel]` table, has no `[roleModel]`
 entry, no `[roleModel] default`, or a dropped malformed one), the model's roles
-(`roles: manager=..., worker=... (via [roleModel]|[roleModel] default|[workerModel]
-(deprecated)|session)`), the `[roleModel]` table, `[workerModel]` alias, and
-malformed keys together with the `default` entry's roles (or "(no table -- every
+(`roles: manager=..., worker=... (via [roleModel]|[roleModel] default|session)`),
+the `[roleModel]` table, and malformed keys together with the `default` entry's roles (or "(no table -- every
 allowlisted model is in scope)" when the table is absent), the allowlist, the
 detected gate, the `fanout` setting and its cap, and the last run's outcome. It also shows a session total (runs,
 calls, tokens, including the classifier); that tally is separate from pi's own
@@ -669,11 +654,9 @@ audit log at `auditLog` (default `<stateDir>/runs.jsonl`), one JSON row per run:
 
 `managerModel` and `workerModel` are the pinned models the manager and worker ran
 on -- the `[roleModel]` entry's `manager` and `worker` for a session model with
-an entry, else the `[roleModel] default` role for a session model neither table
-names, else the session model. A deprecated `[workerModel]` alias entry outranks
-the default for both roles, so an aliased row records the alias as its
-`workerModel` and `null` as its `managerModel`, even when the default names a
-manager. On a `claude` row they are the models that answered, or the configured id
+an entry, else the `[roleModel] default` role for a session model the table
+does not name, else the session model. Rows written while the removed `[workerModel]` alias
+was in use record its mapping as `workerModel` with `managerModel: null`. On a `claude` row they are the models that answered, or the configured id
 for a role that never did; `model` is `null`, and `tokens`, `managerTokens`, and
 `workerTokens` include cache reads and leave out steps that timed out or were
 aborted. `managerTokens` and `workerTokens` are `null` on `pi` rows. Rows from

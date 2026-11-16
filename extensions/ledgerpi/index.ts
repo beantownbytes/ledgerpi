@@ -38,7 +38,6 @@ const MAX_REDIRECTS = 2;
 const ROLE_SOURCE_LABEL: Record<RoleSource, string> = {
 	roleModel: "[roleModel]",
 	roleModelDefault: "[roleModel] default",
-	workerModel: "[workerModel] (deprecated)",
 	session: "session",
 };
 
@@ -665,7 +664,7 @@ export default function (pi: ExtensionAPI) {
 			const roleModelLine =
 				cfg.roleModel === null
 					? "roleModel: (no table -- every allowlisted model is in scope)"
-					: `roleModel: ${Object.keys(cfg.roleModel).join(", ") || "(none)"}; [workerModel] (deprecated): ${Object.keys(cfg.workerModel).join(", ") || "(none)"}; malformed: ${cfg.roleModelMalformed.join(", ") || "(none)"}; default: ${cfg.roleModelDefault === null ? "(none)" : rolePairText(cfg.roleModelDefault)}`;
+					: `roleModel: ${Object.keys(cfg.roleModel).join(", ") || "(none)"}; malformed: ${cfg.roleModelMalformed.join(", ") || "(none)"}; default: ${cfg.roleModelDefault === null ? "(none)" : rolePairText(cfg.roleModelDefault)}`;
 			const scopeNote = active
 				? "in scope"
 				: reason === "not-allowlisted"

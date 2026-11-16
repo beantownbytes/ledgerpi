@@ -55,13 +55,8 @@ providers = ["cerebras", "local", "intranet", "nvidia"]
 # "remote/qwen3.8-flash-next" = { manager = "remote/qwen3.8-flash-next", worker = "local/qwen3.8-27b" }
 # default = { worker = "local/qwen3.8-27b" }
 
-# Deprecated alias of [roleModel] that pins only the worker; the manager stays on
-# the session model and a [roleModel] entry for the same key wins. Warns at load.
-# [workerModel]
-# "remote/qwen3.8-flash-next" = "local/qwen3.8-27b"
-
 # Output-token cap for worker spawns only, keyed by the model the worker runs on
-# (the [roleModel] or [workerModel] worker, else the session model) and valued by a
+# (the [roleModel] worker, else the session model) and valued by a
 # positive integer. A worker whose model has no entry keeps the model's default cap.
 # A malformed entry is reported and dropped; it never makes the config inert. A model
 # the pi registry does not know is reported at first use and keeps its default cap,

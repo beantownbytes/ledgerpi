@@ -1,6 +1,6 @@
 ---
 name: ledger-continue
-description: Hand the remaining implementation work of the current session to the ledgerpi manager-worker loop through ledger_solve, on the configured models (the ledger manager runs on the [roleModel] manager when the session model has a [roleModel] entry, else the [roleModel] default manager, else the session model, and the ledger worker on the entry's worker or the deprecated [workerModel] mapping or else the [roleModel] default worker; a deprecated [workerModel] alias takes both roles, so an aliased session model keeps its manager on the session model), then verify the result and resume the workflow that was running. Use when the user says "/skill:ledger-continue", "continue in the ledger loop", "hand this to the ledger manager/worker", or notices a session implementing inline instead of through ledgerpi. Optional arguments are extra notes for the task.
+description: Hand the remaining implementation work of the current session to the ledgerpi manager-worker loop through ledger_solve, on the configured models (the ledger manager runs on the [roleModel] manager when the session model has a [roleModel] entry, else the [roleModel] default manager, else the session model, and the ledger worker on the entry's worker or else the [roleModel] default worker), then verify the result and resume the workflow that was running. Use when the user says "/skill:ledger-continue", "continue in the ledger loop", "hand this to the ledger manager/worker", or notices a session implementing inline instead of through ledgerpi. Optional arguments are extra notes for the task.
 disable-model-invocation: true
 ---
 
@@ -9,11 +9,9 @@ inline. The loop plans with a `ledger-manager`, implements each task with a fres
 `ledger-worker`, and gates on the repo's tests. The models come from ledgerpi's own config,
 not from this skill: the manager runs on the `[roleModel]` manager when the
 session model has a `[roleModel]` entry, else the `[roleModel] default` manager,
-else the session model, and the worker on the entry's `worker`, the deprecated
-`[workerModel]` mapping, the `[roleModel] default` worker, or the session model
-(`~/.config/ledgerpi/config.toml`). A deprecated `[workerModel]` alias takes both
-roles, so it keeps the manager on the session model rather than using the
-default's manager.
+else the session model, and the worker on the entry's `worker`, the
+`[roleModel] default` worker, or the session model
+(`~/.config/ledgerpi/config.toml`).
 
 Arguments, if any, are extra notes from the user. Fold them into the task in step 4.
 
