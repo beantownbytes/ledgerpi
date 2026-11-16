@@ -54,10 +54,10 @@ export type RolePin = { manager: string | null; worker: string | null };
 
 /**
  * Which config source produced a session model's role pin: a named `[roleModel]`
- * entry, the deprecated `[workerModel]` alias, the reserved `[roleModel] default`
- * fallback, or no source at all (both roles on the session model).
+ * entry, the reserved `[roleModel] default` fallback, or no source at all (both
+ * roles on the session model).
  */
-export type RoleSource = "roleModel" | "workerModel" | "roleModelDefault" | "session";
+export type RoleSource = "roleModel" | "roleModelDefault" | "session";
 
 /** The manager model when `[claude]` names none. */
 export const CLAUDE_MANAGER_DEFAULT = "claude-opus-5-5";
@@ -90,15 +90,6 @@ export interface LedgerpiConfig {
 	/** Thinking level for the manager role. */
 	managerThinking: ThinkingLevel;
 	/**
-	 * Per-session-model worker model, keyed `"provider/modelId"` of the session and
-	 * valued `"provider/modelId"` of the model the worker role spawns on. Deprecated
-	 * alias of `[roleModel]`: a session model the alias does not map runs the worker on
-	 * the table's reserved `default` worker, or on the session model when the table sets
-	 * no default. Where both tables name a session model the `[roleModel]` entry wins,
-	 * and an alias takes both roles, so it also outranks the default.
-	 */
-	workerModel: Record<string, string>;
-	/**
 	 * Per-model output-token cap for worker spawns, keyed `"provider/modelId"` of the
 	 * model the worker runs on and valued by a positive integer. A worker whose model
 	 * has no entry keeps the model's own default cap. Null-prototype map.
@@ -109,9 +100,9 @@ export interface LedgerpiConfig {
 	 * session and valued by the model each role spawns on; every entry names both
 	 * the manager and the worker. `null` means the table is absent and activation
 	 * stays allowlist-only; a non-null record (possibly empty) narrows activation to
-	 * its entries and to the `[workerModel]` alias entries -- unless its reserved
-	 * `default` is set, which widens activation back to every allowlisted model --
-	 * and an entry's session model spawns the two roles on the entry's two models.
+	 * its entries -- unless its reserved `default` is set, which widens activation
+	 * back to every allowlisted model -- and an entry's session model spawns the two
+	 * roles on the entry's two models.
 	 */
 	roleModel: Record<string, { manager: string; worker: string }> | null;
 	/**
@@ -213,7 +204,6 @@ interface OperationalDefaults {
 	maxIters: number;
 	workerThinking: ThinkingLevel;
 	managerThinking: ThinkingLevel;
-	workerModel: Record<string, string>;
 	workerMaxTokens: Record<string, number>;
 	roleModel: Record<string, { manager: string; worker: string }> | null;
 	roleModelDefault: RolePin | null;
@@ -240,7 +230,6 @@ function operationalDefaults(): OperationalDefaults {
 		maxIters: 8,
 		workerThinking: "high",
 		managerThinking: "high",
-		workerModel: Object.create(null) as Record<string, string>,
 		workerMaxTokens: Object.create(null) as Record<string, number>,
 		roleModel: null,
 		roleModelDefault: null,
@@ -378,41 +367,11 @@ function parseWorkerMaxTokens(value: unknown, path: string, warnings: string[]):
 }
 
 /**
- * Parse the `[workerModel]` table into a null-prototype `Record<string, string>`.
- * It is an operational knob, not activation policy, so a malformed table or entry
- * is reported and dropped (the worker then runs on the session model) instead of
- * making the config inert. Both key and value must be `"provider/modelId"`.
- */
-function parseWorkerModel(value: unknown, path: string, warnings: string[]): Record<string, string> {
-	const out: Record<string, string> = Object.create(null);
-	if (value === undefined) return out;
-	if (!isPlainTable(value)) {
-		warnings.push(`[ledgerpi] ${path} has a malformed [workerModel]; workers run on the session model`);
-		return out;
-	}
-	for (const [session, worker] of Object.entries(value as Record<string, unknown>)) {
-		if (!MODEL_REF_RE.test(session) || typeof worker !== "string" || !MODEL_REF_RE.test(worker)) {
-			warnings.push(
-				`[ledgerpi] ignoring malformed [workerModel] entry "${session}"; expected "provider/modelId" = "provider/modelId"`,
-			);
-			continue;
-		}
-		out[session] = worker;
-	}
-	return out;
-}
-
-/**
  * The warning for a dropped `[roleModel]` entry: the shape to write instead and the
- * consequence for that session model, which depends on whether a `[workerModel]`
- * alias still opts it in.
+ * consequence for that session model.
  */
-const malformedRoleEntryWarning = (ref: string, aliasKeepsActive: boolean) =>
-	`[ledgerpi] ignoring malformed [roleModel] entry "${ref}"; expected { manager = "provider/modelId", worker = "provider/modelId" } -- ${
-		aliasKeepsActive
-			? "the deprecated [workerModel] alias keeps this session model active with the manager on the session model"
-			: "this session model stays inactive"
-	}`;
+const malformedRoleEntryWarning = (ref: string) =>
+	`[ledgerpi] ignoring malformed [roleModel] entry "${ref}"; expected { manager = "provider/modelId", worker = "provider/modelId" } -- this session model stays inactive`;
 
 /**
  * Warn about sub-keys of a `[roleModel]` entry that name no role, naming the entry by
@@ -430,17 +389,14 @@ function warnUnknownRoleSubKeys(fields: Record<string, unknown>, where: string, 
 
 /**
  * The warning for a dropped `[roleModel]` default: the shape to write instead and the
- * consequence, which depends on what still opts a session model in -- a named entry
- * keeps the table narrowing to its own keys, the deprecated `[workerModel]` alias keeps
- * its own models active on their worker pin, and a table with neither opts no session
- * model in at all.
+ * consequence, which depends on whether a named entry still opts a session model in:
+ * with one the table keeps narrowing to its own keys, without one no session model is
+ * opted in at all.
  */
-const malformedRoleDefaultWarning = (hasNamedEntries: boolean, hasAliasEntries: boolean): string => {
+const malformedRoleDefaultWarning = (hasNamedEntries: boolean): string => {
 	const consequence = hasNamedEntries
 		? "named [roleModel] entries still apply"
-		: hasAliasEntries
-			? "no [roleModel] entry names a session model; only the [workerModel] aliases opt a model in"
-			: "no [roleModel] entry names a session model, so none is opted in";
+		: "no [roleModel] entry names a session model, so none is opted in";
 	return `[ledgerpi] ignoring malformed [roleModel] default; expected a table naming at least one of manager/worker as "provider/modelId" -- ${consequence}`;
 };
 
@@ -483,16 +439,13 @@ function parseRoleDefault(value: unknown, warnings: string[]): { pin: RolePin | 
  * an entry is kept only when its key and both `manager` and `worker` values are
  * `"provider/modelId"` references; any other shape drops just that entry with a
  * warning naming it, and a malformed table or entry never makes the config inert.
- * `aliasKeys` names the session models the deprecated `[workerModel]` alias still
- * opts in, so a dropped entry's warning can state the real consequence for that
- * model. The literal `default` key is reserved before the reference test, so it is a
+ * The literal `default` key is reserved before the reference test, so it is a
  * fallback pin rather than an entry keyed by a model.
  */
 function parseRoleModel(
 	value: unknown,
 	path: string,
 	warnings: string[],
-	aliasKeys: ReadonlySet<string>,
 ): {
 	table: Record<string, { manager: string; worker: string }> | null;
 	malformed: string[];
@@ -514,10 +467,9 @@ function parseRoleModel(
 			defaultMalformed = parsed.malformed;
 			continue;
 		}
-		const aliasKeepsActive = aliasKeys.has(ref);
 		if (!MODEL_REF_RE.test(ref) || !isPlainTable(entry)) {
 			malformed.push(ref);
-			warnings.push(malformedRoleEntryWarning(ref, aliasKeepsActive));
+			warnings.push(malformedRoleEntryWarning(ref));
 			continue;
 		}
 		const fields = entry as Record<string, unknown>;
@@ -530,14 +482,14 @@ function parseRoleModel(
 			!MODEL_REF_RE.test(worker)
 		) {
 			malformed.push(ref);
-			warnings.push(malformedRoleEntryWarning(ref, aliasKeepsActive));
+			warnings.push(malformedRoleEntryWarning(ref));
 			continue;
 		}
 		table[ref] = { manager, worker };
 	}
 	// The consequence of a dropped default depends on whether any named entry survived,
 	// so it is stated here, where the parsed table is known.
-	if (defaultMalformed) warnings.push(malformedRoleDefaultWarning(Object.keys(table).length > 0, aliasKeys.size > 0));
+	if (defaultMalformed) warnings.push(malformedRoleDefaultWarning(Object.keys(table).length > 0));
 	return { table, malformed, defaultEntry };
 }
 
@@ -622,7 +574,6 @@ const KNOWN_KEYS = new Set([
 	"maxIters",
 	"workerThinking",
 	"managerThinking",
-	"workerModel",
 	"workerMaxTokens",
 	"roleModel",
 	"classifier",
@@ -724,27 +675,11 @@ export function loadConfig(): LedgerpiConfig {
 	if (typeof raw.maxIters === "number" && raw.maxIters > 0) cfg.maxIters = Math.floor(raw.maxIters);
 	cfg.workerThinking = coerceThinking(raw.workerThinking, cfg.workerThinking);
 	cfg.managerThinking = coerceThinking(raw.managerThinking, cfg.managerThinking);
-	cfg.workerModel = parseWorkerModel(raw.workerModel, path, warnings);
 	cfg.workerMaxTokens = parseWorkerMaxTokens(raw.workerMaxTokens, path, warnings);
-	if (raw.workerModel !== undefined) {
-		warnings.push(
-			`[ledgerpi] [workerModel] is deprecated and will be removed in a later release; move each entry to [roleModel] as { manager = <session model>, worker = <mapped model> }`,
-		);
-	}
-	const roleModel = parseRoleModel(raw.roleModel, path, warnings, new Set(Object.keys(cfg.workerModel)));
+	const roleModel = parseRoleModel(raw.roleModel, path, warnings);
 	cfg.roleModel = roleModel.table;
 	cfg.roleModelDefault = roleModel.defaultEntry;
 	cfg.roleModelMalformed = roleModel.malformed;
-	// The both-tables conflict is computed on the parsed tables, so it names only the
-	// keys where a [roleModel] entry actually survives to take precedence over the
-	// alias. A key whose [roleModel] entry was dropped stays served by its alias.
-	if (cfg.roleModel !== null) {
-		for (const key of Object.keys(cfg.workerModel)) {
-			if (key in cfg.roleModel) {
-				warnings.push(`[ledgerpi] "${key}" is in both [workerModel] and [roleModel]; [roleModel] wins`);
-			}
-		}
-	}
 	if (typeof raw.classifier === "boolean") cfg.classifier = raw.classifier;
 	cfg.trigger = coerceInputTrigger(raw.trigger, cfg.trigger);
 	cfg.autoTrigger = coerceAutoTrigger(raw.autoTrigger, cfg.autoTrigger);
@@ -779,8 +714,8 @@ export function modelAllowlisted(cfg: LedgerpiConfig, provider: string, modelId:
  * Whether the loop should activate for this provider+model: enabled, the provider
  * in scope, the model permitted by that provider's allowlist, and -- when a
  * `[roleModel]` table is present -- the session model opted in by a `[roleModel]`
- * entry, a `[workerModel]` alias entry, or (via the reserved `default` entry) the
- * table's default fallback. This is the single activation gate.
+ * entry or (via the reserved `default` entry) the table's default fallback. This is
+ * the single activation gate.
  */
 export function inScope(cfg: LedgerpiConfig, provider: string | undefined, modelId: string | undefined): boolean {
 	return scopeReason(cfg, provider, modelId) === "in-scope";
@@ -808,13 +743,12 @@ export function scopeReason(
 	if (cfg.roleModel === null) return "in-scope";
 	if (ref === null) return "no-role-entry";
 	if (ref in cfg.roleModel) return "in-scope";
-	if (ref in cfg.workerModel) return "in-scope";
 	if (cfg.roleModelMalformed.includes(ref)) return "malformed-role-entry";
 	// The default re-widens activation to every allowlisted model, but the malformed
 	// check above outranks it: a model whose own entry was dropped stays inactive.
 	// Once a default is present this catch-all is therefore unreachable for any
 	// non-null ref (the null ref returned above), and it stays reachable only for a
-	// table with no entry, no alias, no malformed entry, and no default -- intended,
+	// table with no matching entry, no malformed entry, and no default -- intended,
 	// not a dead branch.
 	if (cfg.roleModelDefault !== null) return "in-scope";
 	return "no-role-entry";
@@ -828,13 +762,10 @@ export function modelRef(provider: string | undefined, modelId: string | undefin
 /**
  * The model each role spawns on for this session model, or null when the scope
  * gate denies activation. `source "roleModel"`: both roles take the `[roleModel]`
- * entry for `provider/modelId`. `source "workerModel"`: the table is present but
- * names no entry for the session model while the deprecated `[workerModel]` alias
- * does, so the manager stays on the session model (null) and the worker takes the
- * alias value. `source "roleModelDefault"`: nothing else names the session model and
- * the table has a reserved `default` entry, whose roles apply (a role it omits is
- * null). `source "session"`: nothing names either role; both are null, which means
- * the session model.
+ * entry for `provider/modelId`. `source "roleModelDefault"`: nothing else names the
+ * session model and the table has a reserved `default` entry, whose roles apply (a
+ * role it omits is null). `source "session"`: nothing names either role; both are
+ * null, which means the session model.
  */
 export function roleModelsFor(
 	cfg: LedgerpiConfig,
@@ -845,8 +776,6 @@ export function roleModelsFor(
 	const ref = modelRef(provider, modelId);
 	const entry = cfg.roleModel !== null && ref !== null && ref in cfg.roleModel ? cfg.roleModel[ref] : undefined;
 	if (entry !== undefined) return { manager: entry.manager, worker: entry.worker, source: "roleModel" };
-	const alias = workerModelFor(cfg, provider, modelId);
-	if (alias !== null) return { manager: null, worker: alias, source: "workerModel" };
 	if (cfg.roleModelDefault !== null) {
 		return {
 			manager: cfg.roleModelDefault.manager,
@@ -855,21 +784,6 @@ export function roleModelsFor(
 		};
 	}
 	return { manager: null, worker: null, source: "session" };
-}
-
-/**
- * The deprecated `[workerModel]` alias entry for this session model, or null to
- * run the worker on the session model. A plain alias-table lookup with no scope
- * gate: `roleModelsFor` is the gated role lookup, prefers a `[roleModel]` entry
- * when both tables name the session model, and reads the alias through here.
- */
-export function workerModelFor(
-	cfg: LedgerpiConfig,
-	provider: string | undefined,
-	modelId: string | undefined,
-): string | null {
-	const ref = modelRef(provider, modelId);
-	return ref !== null ? (cfg.workerModel[ref] ?? null) : null;
 }
 
 /**

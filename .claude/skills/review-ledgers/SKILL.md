@@ -131,9 +131,10 @@ changes.
   or a run that bypassed it. `managerModel` is the `"provider/modelId"` the manager role
   ran on through the `[roleModel]` pin or its reserved `default` entry, or `null` when it
   ran on the session model (`provider`/`model`); `workerModel` is the worker's model -- the
-  `[roleModel]` entry's `worker`, or, for a key absent from the table, the deprecated
-  `[workerModel]` mapping or else the `default` entry's `worker` -- or `null` when the
-  worker ran on the session model. Rows from a version predating a
+  `[roleModel]` entry's `worker`, or, for a key absent from the table, the `default`
+  entry's `worker` -- or `null` when the worker ran on the session model. Rows written
+  before the `[workerModel]` alias was removed may carry its mapping as `workerModel`
+  with `managerModel: null`. Rows from a version predating a
   field have the key missing and aggregate as that role's `unknown`, a distinct bucket
   from `session`.
   `planSource` is `"caller"` when the run was handed an approved plan (`plan_file` /

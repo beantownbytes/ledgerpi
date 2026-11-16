@@ -27,7 +27,6 @@ import {
 	redirectSkillAllowed,
 	roleModelsFor,
 	scopeReason,
-	workerModelFor,
 } from "../packages/core/src/config.ts";
 import { detectGate, runGate } from "../packages/core/src/gate.ts";
 import {
@@ -3768,7 +3767,13 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 
 	// --- audit and worker mapping use the provider/model snapshotted before classification ---
 	{
-		writeConfig({ gate: "true", maxIters: 4, workerModel: { "cerebras/qwen-3.8-27b": "local/qwen3.8-27b" } });
+		writeConfig({
+			gate: "true",
+			maxIters: 4,
+			roleModel: {
+				"cerebras/qwen-3.8-27b": { manager: "cerebras/qwen-3.8-27b", worker: "local/qwen3.8-27b" },
+			},
+		});
 		const script: Step[] = [
 			{ text: PLAN },
 			{ text: IDEATE },
@@ -4439,33 +4444,19 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		await handlers.session_shutdown({ type: "session_shutdown", reason: "quit" }, ctx);
 	}
 
-	// --- workerModel: a mapped session model spawns the worker on the mapped model ---
+	// --- roleModel default: a worker-only default labels the passes in spawn order and names the worker model ---
 	{
-		writeConfig({ gate: "true", maxIters: 4, workerModel: { "cerebras/qwen-3.8-27b": "local/qwen3.8-27b" } });
+		writeConfig({
+			gate: "true",
+			maxIters: 4,
+			roleModel: { default: { worker: "local/qwen3.8-27b" } },
+		});
 		const { handlers, ctx, bus } = fresh(CONVERGE, "code");
 		const r = await handlers.input(input("fix the failing test"), ctx);
-		const managerModels = bus.spawned.flatMap((t, i) => (t === "ledger-manager" ? [bus.spawnedModels[i]] : []));
-		const workerModels = bus.spawned.flatMap((t, i) => (t === "ledger-worker" ? [bus.spawnedModels[i]] : []));
-		check(
-			"a mapped session model spawns every worker on the mapped model",
-			workerModels.length > 0 && workerModels.every((m) => m === "local/qwen3.8-27b"),
-			workerModels.join(","),
-		);
-		check(
-			"a mapped session model keeps the manager on the session model",
-			managerModels.length > 0 && managerModels.every((m) => m === null),
-			managerModels.join(","),
-		);
-		check(
-			"a mapped session model labels the manager and worker with their own models",
-			allLabelled(bus, "ledger-manager", "manager", "cerebras/qwen-3.8-27b") &&
-				allLabelled(bus, "ledger-worker", "worker", "local/qwen3.8-27b"),
-			bus.spawnedDescriptions.join(","),
-		);
 		const managerDescs = descriptionsFor(bus, "ledger-manager");
 		const workerDescs = descriptionsFor(bus, "ledger-worker");
 		check(
-			"a mapped session model labels the manager passes in spawn order as plan, manage, review",
+			"a worker-only default labels the manager passes in spawn order as plan, manage, review",
 			managerDescs.join(" | ") ===
 				[
 					"ledger manager (cerebras/qwen-3.8-27b, plan)",
@@ -4475,7 +4466,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			managerDescs.join(" | "),
 		);
 		check(
-			"a mapped session model labels the worker passes in spawn order as ideate, work",
+			"a worker-only default labels the worker passes in spawn order as ideate, work",
 			workerDescs.join(" | ") ===
 				["ledger worker (local/qwen3.8-27b, ideate)", "ledger worker (local/qwen3.8-27b, work)"].join(" | "),
 			workerDescs.join(" | "),
@@ -4485,16 +4476,15 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			typeof r?.text === "string" && r.text.includes("Worker model: local/qwen3.8-27b"),
 			r?.text?.slice(-400),
 		);
-		const row = readAudit()
-			.filter((x) => x.event === "run")
-			.at(-1);
-		check("the audit row records the worker model", row?.workerModel === "local/qwen3.8-27b", row?.workerModel);
-		check("the audit row records a null manager model", row?.managerModel === null, String(row?.managerModel));
 	}
 
-	// --- workerModel: a supplied plan drops the plan and ideate passes from the labeled spawn order ---
+	// --- roleModel default: a supplied plan drops the plan and ideate passes from the labeled spawn order ---
 	{
-		writeConfig({ gate: "true", maxIters: 4, workerModel: { "cerebras/qwen-3.8-27b": "local/qwen3.8-27b" } });
+		writeConfig({
+			gate: "true",
+			maxIters: 4,
+			roleModel: { default: { worker: "local/qwen3.8-27b" } },
+		});
 		const planFile = join(root, "supplied-order-plan.md");
 		writeFileSync(planFile, "change the parser");
 		const script: Step[] = [
@@ -4527,18 +4517,18 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		);
 	}
 
-	// --- workerModel: an unmapped session model runs every role on the session model ---
+	// --- no [roleModel] table: every role runs on the session model ---
 	{
-		writeConfig({ gate: "true", maxIters: 4, workerModel: { "remote/qwen3.8-flash-next": "local/qwen3.8-27b" } });
+		writeConfig({ gate: "true", maxIters: 4 });
 		const { handlers, ctx, bus } = fresh(CONVERGE, "code");
 		const r = await handlers.input(input("fix the failing test"), ctx);
 		check(
-			"an unmapped session model spawns every role with no model override",
+			"with no [roleModel] table every role spawns with no model override",
 			bus.spawned.length > 0 && bus.spawnedModels.every((m) => m === null),
 			bus.spawnedModels.join(","),
 		);
 		check(
-			"an unmapped session model labels every role with the session model",
+			"with no [roleModel] table every role is labeled with the session model",
 			allLabelled(bus, "ledger-manager", "manager", "cerebras/qwen-3.8-27b") &&
 				allLabelled(bus, "ledger-worker", "worker", "cerebras/qwen-3.8-27b"),
 			bus.spawnedDescriptions.join(","),
@@ -4552,43 +4542,6 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			.filter((x) => x.event === "run")
 			.at(-1);
 		check("the audit row records a null worker model", row?.workerModel === null, String(row?.workerModel));
-	}
-
-	// --- workerModel: a malformed value is dropped and the config stays active ---
-	{
-		writeConfig({
-			gate: "true",
-			maxIters: 4,
-			workerModel: { "cerebras/qwen-3.8-27b": "no-slash", "remote/qwen3.8-flash-next": "local/qwen3.8-27b" },
-		});
-		const { cfg, errors } = loadCapturingErrors();
-		check("a malformed workerModel value keeps the config active", cfg.enabled && inScope(cfg, "cerebras", "x"));
-		check(
-			"a malformed workerModel entry is reported once by name, not as an unknown key",
-			errors.filter((e) => e.includes('malformed [workerModel] entry "cerebras/qwen-3.8-27b"')).length === 1 &&
-				!errors.some((e) => e.includes("unknown config key")),
-			errors.join(" | "),
-		);
-		check(
-			"dropping a malformed workerModel entry keeps the valid ones",
-			workerModelFor(cfg, "remote", "qwen3.8-flash-next") === "local/qwen3.8-27b" &&
-				workerModelFor(cfg, "cerebras", "qwen-3.8-27b") === null,
-		);
-		writeConfig({ gate: "true", workerModel: "not-a-table" });
-		const table = loadCapturingErrors();
-		check(
-			"a non-table workerModel is reported and leaves the config active",
-			table.cfg.enabled && table.errors.some((e) => e.includes("malformed [workerModel];")),
-			table.errors.join(" | "),
-		);
-		writeConfig({ gate: "true", maxIters: 4, workerModel: { "cerebras/qwen-3.8-27b": "no-slash" } });
-		const { handlers, ctx, bus } = fresh(CONVERGE, "code");
-		await handlers.input(input("fix the failing test"), ctx);
-		check(
-			"a malformed workerModel value runs the worker on the session model",
-			bus.spawned.length > 0 && bus.spawnedModels.every((m) => m === null),
-			bus.spawnedModels.join(","),
-		);
 	}
 
 	// --- workerMaxTokens: a valid entry loads; absent is an empty map ---
@@ -4701,7 +4654,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		writeConfig({
 			gate: "true",
 			maxIters: 4,
-			workerModel: { [sessionRef]: mappedRef },
+			roleModel: { default: { worker: mappedRef } },
 			workerMaxTokens: { [mappedRef]: 4096 },
 		});
 		{
@@ -4814,63 +4767,6 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			"the hand-off names the pinned worker model",
 			typeof r?.text === "string" && r.text.includes("Worker model: local/qwen3.8-w"),
 			r?.text?.slice(-400),
-		);
-	}
-
-	// --- roleModel: a model absent from the table keeps its [workerModel] alias ---
-	{
-		writeConfig({
-			gate: "true",
-			maxIters: 4,
-			roleModel: {
-				"remote/qwen3.8-flash-next": { manager: "local/qwen3.8-m", worker: "local/qwen3.8-w" },
-				default: { manager: "local/qwen3.8-dm", worker: "local/qwen3.8-dw" },
-			},
-			workerModel: { "cerebras/qwen-3.8-27b": "local/qwen3.8-27b" },
-		});
-		const { handlers, ctx, bus } = fresh(CONVERGE, "code");
-		const r = await handlers.input(input("fix the failing test"), ctx);
-		const managerModels = bus.spawned.flatMap((t, i) => (t === "ledger-manager" ? [bus.spawnedModels[i]] : []));
-		const workerModels = bus.spawned.flatMap((t, i) => (t === "ledger-worker" ? [bus.spawnedModels[i]] : []));
-		check(
-			"a [workerModel] alias under a present [roleModel] keeps the manager on the session model",
-			managerModels.length > 0 && managerModels.every((m) => m === null),
-			managerModels.join(","),
-		);
-		check(
-			"a [workerModel] alias under a present [roleModel] spawns every worker on the aliased model",
-			workerModels.length > 0 && workerModels.every((m) => m === "local/qwen3.8-27b"),
-			workerModels.join(","),
-		);
-		check(
-			"a [workerModel] alias under a present [roleModel] labels each role with its own model",
-			allLabelled(bus, "ledger-manager", "manager", "cerebras/qwen-3.8-27b") &&
-				allLabelled(bus, "ledger-worker", "worker", "local/qwen3.8-27b"),
-			bus.spawnedDescriptions.join(","),
-		);
-		const row = readAudit()
-			.filter((x) => x.event === "run")
-			.at(-1);
-		check(
-			"the audit row records a null manager model under the alias",
-			row?.managerModel === null,
-			String(row?.managerModel),
-		);
-		check(
-			"the audit row records the aliased worker model",
-			row?.workerModel === "local/qwen3.8-27b",
-			row?.workerModel,
-		);
-		check(
-			"the hand-off says the aliased run left the manager on the session model",
-			typeof r?.text === "string" && r.text.includes("Manager model: session model"),
-			r?.text?.slice(-400),
-		);
-		const aliased = roleModelsFor(loadConfig(), "cerebras", "qwen-3.8-27b");
-		check(
-			"a [workerModel] alias under a present [roleModel] wins over the default for both roles",
-			aliased?.manager === null && aliased?.worker === "local/qwen3.8-27b" && aliased?.source === "workerModel",
-			JSON.stringify(aliased),
 		);
 	}
 
@@ -5026,43 +4922,22 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		);
 
 		writeConfig({ gate: "true", workerModel: { "cerebras/qwen-3.8-27b": "local/qwen3.8-27b" } });
-		const dep = loadCapturingErrors();
+		const stale = loadCapturingErrors();
 		check(
-			"a present [workerModel] key warns once that it is deprecated",
-			dep.errors.filter((e) => e.includes("[workerModel] is deprecated and will be removed in a later release"))
-				.length === 1,
-			dep.errors.join(" | "),
+			"a stale [workerModel] key is reported once as an unknown key, with no deprecation warning",
+			stale.errors.filter((e) => e.includes('ignoring unknown config key "workerModel"')).length === 1 &&
+				!stale.errors.some((e) => e.includes("is deprecated")),
+			stale.errors.join(" | "),
 		);
-
-		writeConfig({
-			gate: "true",
-			roleModel: {
-				"cerebras/qwen-3.8-27b": { manager: "local/qwen3.8-27b", worker: "local/qwen3.8-27b" },
-			},
-			workerModel: { "cerebras/qwen-3.8-27b": "openai/other" },
-		});
-		const both = loadCapturingErrors();
+		const staleRoles = roleModelsFor(stale.cfg, "cerebras", "qwen-3.8-27b");
 		check(
-			"a key in both tables warns that [roleModel] wins, with the deprecation warning too",
-			both.errors.filter((e) => e.includes("in both [workerModel] and [roleModel]; [roleModel] wins")).length ===
-				1 && both.errors.some((e) => e.includes("[workerModel] is deprecated")),
-			both.errors.join(" | "),
-		);
-
-		writeConfig({
-			gate: "true",
-			roleModel: { "cerebras/qwen-3.8-27b": { worker: "local/qwen3.8-27b" } },
-			workerModel: { "cerebras/qwen-3.8-27b": "local/qwen3.8-27b" },
-		});
-		const bothDropped = loadCapturingErrors();
-		check(
-			"a dropped [roleModel] entry with a valid alias warns that the alias keeps the model active",
-			bothDropped.errors.some((e) =>
-				e.includes("the deprecated [workerModel] alias keeps this session model active"),
-			) &&
-				!bothDropped.errors.some((e) => e.includes("in both [workerModel] and [roleModel]")) &&
-				bothDropped.cfg.roleModelMalformed.includes("cerebras/qwen-3.8-27b"),
-			bothDropped.errors.join(" | "),
+			"a stale [workerModel] key leaves the config active and pins nothing",
+			stale.cfg.enabled &&
+				scopeReason(stale.cfg, "cerebras", "qwen-3.8-27b") === "in-scope" &&
+				staleRoles?.manager === null &&
+				staleRoles?.worker === null &&
+				staleRoles?.source === "session",
+			JSON.stringify(staleRoles),
 		);
 	}
 
@@ -5287,27 +5162,6 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 				) &&
 				scopeReason(defaultOnlyMalformed.cfg, "cerebras", "qwen-3.8-27b") === "no-role-entry",
 			defaultOnlyMalformed.errors.join(" | "),
-		);
-
-		// A [workerModel] alias still opts its own models in, so the warning must not
-		// claim that nothing is.
-		writeConfig({
-			gate: "true",
-			roleModel: { default: { manager: "no-slash" } },
-			workerModel: { "cerebras/qwen-3.8-27b": "local/alias-w" },
-		});
-		const aliasOnlyMalformed = loadCapturingErrors();
-		check(
-			"a malformed default in an alias-only table says the aliases still opt a model in",
-			aliasOnlyMalformed.cfg.roleModelDefault === null &&
-				aliasOnlyMalformed.errors.some(
-					(e) =>
-						e.includes("malformed [roleModel] default") &&
-						e.includes("only the [workerModel] aliases opt a model in") &&
-						!e.includes("so none is opted in"),
-				) &&
-				roleModelsFor(aliasOnlyMalformed.cfg, "cerebras", "qwen-3.8-27b")?.source === "workerModel",
-			aliasOnlyMalformed.errors.join(" | "),
 		);
 
 		// A stray sub-key is reported and ignored; the default itself still applies.
@@ -6177,24 +6031,16 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			inScope(s3, "cerebras", "m-x") === false && scopeReason(s3, "cerebras", "m-x") === "not-allowlisted",
 		);
 
-		// S4: no [roleModel] table -- the legacy gate, alias pinning included.
-		writeConfig({ gate: "true", workerModel: { "cerebras/m-y": "local/b-y" } });
-		const s4 = loadCapturingErrors();
+		// S4: no [roleModel] table -- the legacy gate.
+		writeConfig({ gate: "true" });
+		const s4 = loadConfig();
 		check(
 			"S4: an allowlisted model with no [roleModel] table is in scope",
-			inScope(s4.cfg, "cerebras", "m-y") === true && scopeReason(s4.cfg, "cerebras", "m-y") === "in-scope",
+			inScope(s4, "cerebras", "m-y") === true && scopeReason(s4, "cerebras", "m-y") === "in-scope",
 		);
-		const s4mapped = roleModelsFor(s4.cfg, "cerebras", "m-y");
+		const s4unmapped = roleModelsFor(s4, "cerebras", "m-z");
 		check(
-			"S4: the alias entry pins the worker and leaves the manager on the session model",
-			s4mapped !== null &&
-				s4mapped.manager === null &&
-				s4mapped.worker === "local/b-y" &&
-				s4mapped.source === "workerModel",
-		);
-		const s4unmapped = roleModelsFor(s4.cfg, "cerebras", "m-z");
-		check(
-			"S4: an unmapped model runs every role on the session model",
+			"S4: a model with no [roleModel] table runs every role on the session model",
 			s4unmapped !== null &&
 				s4unmapped.manager === null &&
 				s4unmapped.worker === null &&
@@ -6217,8 +6063,8 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 				s5roles.source === "roleModel",
 		);
 
-		// S6: the table is present but names no entry for the model; the deprecated
-		// alias still opts it in, manager on the session model.
+		// S6: a stale [workerModel] key pins nothing; under a present [roleModel] table a
+		// model the table does not name stays out of scope.
 		writeConfig({
 			gate: "true",
 			roleModel: { "cerebras/other": { manager: "local/m-x", worker: "local/w-x" } },
@@ -6226,16 +6072,14 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		});
 		const s6 = loadCapturingErrors();
 		check(
-			"S6: an alias entry under a present [roleModel] table is in scope",
-			inScope(s6.cfg, "cerebras", "m-y") === true && scopeReason(s6.cfg, "cerebras", "m-y") === "in-scope",
+			"S6: a stale workerModel entry under a present [roleModel] table does not opt its model in",
+			inScope(s6.cfg, "cerebras", "m-y") === false && scopeReason(s6.cfg, "cerebras", "m-y") === "no-role-entry",
+			s6.errors.join(" | "),
 		);
-		const s6roles = roleModelsFor(s6.cfg, "cerebras", "m-y");
 		check(
-			"S6: the worker takes the alias model and the manager the session model",
-			s6roles !== null &&
-				s6roles.manager === null &&
-				s6roles.worker === "local/b-y" &&
-				s6roles.source === "workerModel",
+			"S6: the stale workerModel key is reported as an unknown key",
+			s6.errors.filter((e) => e.includes('ignoring unknown config key "workerModel"')).length === 1,
+			s6.errors.join(" | "),
 		);
 
 		// S7: a dropped [roleModel] entry leaves its model opted out, with its own reason,
@@ -6346,36 +6190,6 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		// Overlaps: the decision list resolves them in order.
 		writeConfig({
 			gate: "true",
-			roleModel: { "cerebras/m-y": { manager: "local/m-y", worker: "local/w-y" } },
-			workerModel: { "cerebras/m-y": "local/alias-y" },
-		});
-		const bothTables = loadCapturingErrors();
-		const bothRoles = roleModelsFor(bothTables.cfg, "cerebras", "m-y");
-		check(
-			"overlap: a model in both tables resolves to the [roleModel] entry",
-			bothRoles !== null &&
-				bothRoles.manager === "local/m-y" &&
-				bothRoles.worker === "local/w-y" &&
-				bothRoles.source === "roleModel" &&
-				bothTables.errors.some((e) => e.includes("in both [workerModel] and [roleModel]")),
-		);
-		writeConfig({
-			gate: "true",
-			roleModel: { "cerebras/m-y": { manager: "local/m-y" } },
-			workerModel: { "cerebras/m-y": "local/alias-y" },
-		});
-		const overlapped = loadCapturingErrors();
-		const overlappedRoles = roleModelsFor(overlapped.cfg, "cerebras", "m-y");
-		check(
-			"overlap: a malformed [roleModel] entry with a valid alias resolves to the alias",
-			overlappedRoles !== null &&
-				overlappedRoles.manager === null &&
-				overlappedRoles.worker === "local/alias-y" &&
-				overlappedRoles.source === "workerModel" &&
-				scopeReason(overlapped.cfg, "cerebras", "m-y") === "in-scope",
-		);
-		writeConfig({
-			gate: "true",
 			allowlist: { cerebras: ["m-x"] },
 			roleModel: { "cerebras/m-y": { manager: "local/m-y", worker: "local/w-y" } },
 		});
@@ -6406,8 +6220,8 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			text,
 		);
 		check(
-			"/ledger: the roleModel line lists the opted-in entry with empty alias and malformed lists",
-			text.includes("roleModel: cerebras/qwen-3.8-27b; [workerModel] (deprecated): (none); malformed: (none)"),
+			"/ledger: the roleModel line lists the opted-in entry with an empty malformed list",
+			text.includes("roleModel: cerebras/qwen-3.8-27b; malformed: (none)"),
 			text,
 		);
 	}
@@ -6426,7 +6240,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		check("/ledger: a gate-denied model reports no roles at all", text.includes("roles: (inactive)"), text);
 		check(
 			"/ledger: the roleModel line names the dropped entry under malformed",
-			text.includes("roleModel: (none); [workerModel] (deprecated): (none); malformed: cerebras/qwen-3.8-27b"),
+			text.includes("roleModel: (none); malformed: cerebras/qwen-3.8-27b"),
 			text,
 		);
 	}
@@ -6449,15 +6263,13 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		);
 		check(
 			"/ledger: the roleModel line lists the opted-in model that is not the session model",
-			text.includes(
-				"roleModel: cerebras/other; [workerModel] (deprecated): (none); malformed: (none); default: (none)",
-			),
+			text.includes("roleModel: cerebras/other; malformed: (none); default: (none)"),
 			text,
 		);
 	}
 
 	// S9: the reserved default pins the roles for a model no entry names, and it is
-	// labelled as its own source rather than the deprecated alias.
+	// labeled as its own source.
 	writeConfig({
 		gate: "true",
 		roleModel: { default: { manager: "local/qwen3.8-dm", worker: "local/qwen3.8-dw" } },
@@ -6472,28 +6284,28 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			text.split("\n")[1],
 		);
 		check(
-			"/ledger: the roles line labels the reserved default as its own source, not the deprecated alias",
+			"/ledger: the roles line labels the reserved default as its own source",
 			text.includes("roles: manager=local/qwen3.8-dm, worker=local/qwen3.8-dw (via [roleModel] default)"),
 			text,
 		);
 		check(
 			"/ledger: the roleModel line names the default instead of rendering (none)",
 			text.includes(
-				"roleModel: (none); [workerModel] (deprecated): (none); malformed: (none); default: manager=local/qwen3.8-dm, worker=local/qwen3.8-dw",
+				"roleModel: (none); malformed: (none); default: manager=local/qwen3.8-dm, worker=local/qwen3.8-dw",
 			),
 			text,
 		);
 	}
 
-	// S4: an absent table keeps the legacy behavior, including the alias role line.
-	writeConfig({ gate: "true", workerModel: { "cerebras/qwen-3.8-27b": "local/qwen3.8-27b" } });
+	// S4: an absent table keeps the legacy behavior: both roles on the session model.
+	writeConfig({ gate: "true" });
 	{
 		const { commands, ctx, notices } = fresh([], "code", {}, { hasUI: true });
 		await commands.ledgerpi.handler(undefined, ctx);
 		const text = notices.at(-1) ?? "";
 		check(
-			"/ledger: an absent [roleModel] table shows the alias role via the deprecated table",
-			text.includes("roles: manager=session model, worker=local/qwen3.8-27b (via [workerModel] (deprecated))"),
+			"/ledger: an absent [roleModel] table runs both roles on the session model",
+			text.includes("roles: manager=session model, worker=session model (via session)"),
 			text,
 		);
 		check(
