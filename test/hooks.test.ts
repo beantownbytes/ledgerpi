@@ -2102,11 +2102,34 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			"### NEXT\n- t\n### FILES\n- src/a.ts\n**ACCEPTANCE CRITERIA**\n- a() throws",
 			"### NEXT\n- t\n### Files to change:\n- src/a.ts\n### ACCEPTANCE\n- a() throws",
 			"### NEXT\n- t\nFILES TO CHANGE:\n- src/a.ts\nAcceptance:\n- a() throws",
+			"### NEXT\n- t\n### ACCEPT\n- a() throws\nFiles:\n- src/a.ts",
+			"Next:\n- t\nFiles:\n- src/a.ts\nAccept:\n- a() throws",
+			"### NEXT\n- t\nfiles:\n- src/a.ts\n### Accept:\n- a() throws",
 		].map((reply) => parseBrief(manageSections(reply)));
 		check(
 			"a manage reply's FILES TO CHANGE / ACCEPTANCE CRITERIA headers read as FILES and ACCEPT",
 			echoed.every((b) => b.task === "t" && b.files.join(",") === "src/a.ts" && b.accept.join(",") === "a() throws"),
 			JSON.stringify(echoed),
+		);
+		const single = manageSections(
+			"Status:\ncontinue\nNext:\n- t\nFiles:\n- src/a.ts\nAccept:\n- a() throws\nVerify:\nnpm test\nMode:\nfleet: two files\nTasks:\n- one\n- two",
+		);
+		check(
+			"mixed-case single-word colon headers in a manage reply each open their own section",
+			JSON.stringify(Object.keys(single)) === '["STATUS","NEXT","FILES","ACCEPT","VERIFY","MODE","TASKS"]' &&
+				parseBrief(single).verify === "npm test" &&
+				parseMode(single).mode === "fleet" &&
+				single.TASKS === "- one\n- two",
+			JSON.stringify(single),
+		);
+		const inline = manageSections("### NEXT\n- t\n### ACCEPT\n- x\nNext steps:\nFiles: src/a.ts\n- Files:\n- y");
+		check(
+			"inline, bulleted, and multi-word colon lines in a manage reply stay content",
+			JSON.stringify(Object.keys(inline)) === '["NEXT","ACCEPT"]' &&
+				inline.ACCEPT.includes("Next steps:") &&
+				inline.ACCEPT.includes("Files: src/a.ts") &&
+				inline.ACCEPT.includes("- Files:"),
+			JSON.stringify(inline),
 		);
 		const workerNotes = sections("### NOTES\n- a\n### Out of scope\n- b\n**OUT OF SCOPE**\n- c\n### NEXT\n- x");
 		check(
@@ -2116,12 +2139,15 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 				workerNotes.NOTES.includes("- c"),
 			JSON.stringify(workerNotes),
 		);
-		const prose = sections("### NOTES\n**APPROACH A**\nbody\nNEXT STEPS:\nmore\n### KEY RISKS\nrisk\n### NEXT\n- x");
+		const prose = sections(
+			"### NOTES\n**APPROACH A**\nbody\nNEXT STEPS:\nmore\nFiles:\n- b\n### KEY RISKS\nrisk\n### NEXT\n- x",
+		);
 		check(
-			"all-caps multi-word lines other than OUT OF SCOPE stay inside the section",
+			"all-caps multi-word lines other than OUT OF SCOPE, and a mixed-case Files:, stay inside the section",
 			JSON.stringify(Object.keys(prose)) === '["NOTES","NEXT"]' &&
 				prose.NOTES.includes("**APPROACH A**") &&
 				prose.NOTES.includes("more") &&
+				prose.NOTES.includes("Files:") &&
 				prose.NOTES.includes("risk"),
 			JSON.stringify(prose),
 		);
