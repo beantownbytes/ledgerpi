@@ -57,8 +57,13 @@ export function sections(text: string): Record<string, string> {
 
 const MANAGE_HEADERS: [RegExp, string][] = [
 	["out[ _-]of[ _-]scope", "OUT_OF_SCOPE"],
-	["files[ _-]to[ _-]change", "FILES"],
-	["acceptance(?:[ _-]criteria)?", "ACCEPT"],
+	["files(?:[ _-]to[ _-]change)?", "FILES"],
+	["accept(?:ance(?:[ _-]criteria)?)?", "ACCEPT"],
+	["verify", "VERIFY"],
+	["next", "NEXT"],
+	["tasks", "TASKS"],
+	["status", "STATUS"],
+	["mode", "MODE"],
 ].map(([name, key]) => [
 	new RegExp(`^(?:#{1,3}\\s*${name}\\s*:?|\\*\\*${name}\\*\\*\\s*:?|${name}\\s*:)\\s*$`, "i"),
 	key,
@@ -66,11 +71,13 @@ const MANAGE_HEADERS: [RegExp, string][] = [
 
 /**
  * Splits a manage reply into its sections, like `sections()`, and also reads the
- * brief headers spelled as the worker prompt labels them -- OUT OF SCOPE, FILES TO
- * CHANGE, ACCEPTANCE (CRITERIA) -- with spaces or hyphens, in any case, as a `###`
- * heading, a bold line, or a line ending in a colon. A manage reply has only list
- * sections, so such a line is the header; other roles' replies use `sections()`,
- * so the same line inside their prose stays content.
+ * manage contract's headers -- STATUS, NEXT, FILES (TO CHANGE), ACCEPT(ANCE)
+ * (CRITERIA), OUT OF SCOPE, VERIFY, MODE, TASKS -- with spaces or hyphens, in any
+ * case, as a `###` heading, a bold line, or a line ending in a colon. The
+ * single-word names matter for the mixed-case colon spelling (`Files:`), which
+ * `sections()` does not read. A manage reply has only list sections, so such a
+ * line is the header; other roles' replies use `sections()`, so the same line
+ * inside their prose stays content.
  */
 export function manageSections(text: string): Record<string, string> {
 	return sections(
