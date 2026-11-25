@@ -87,11 +87,15 @@ export function auditRun(
 	},
 ): void {
 	// stopDetail is the spawn-failure category on spawn-failure rows and null on
-	// every other stop (including aborted) -- never the raw error text, which stays
-	// in the per-turn ledger only. A spawn-failure LoopResult constructed without a
-	// detail still defaults to "other" so the row always carries a category.
+	// every other stop (including aborted). A spawn-failure LoopResult constructed
+	// without a detail still defaults to "other" so the row always carries a category.
 	const stopDetail: SpawnFailureDetail | null =
 		result.stop === "spawn-failure" ? (result.stopDetail ?? "other") : null;
+	// stopError is the loop's already-normalized error line for the spawn that ended
+	// a spawn-failure run -- one line, length-capped in the loop -- and null on every
+	// other stop. The row carries only that normalized line; the full raw error text
+	// stays in the per-turn ledger.
+	const stopError: string | null = result.stop === "spawn-failure" ? (result.stopError ?? null) : null;
 	append(cfg.auditLog, {
 		event: "run",
 		harness: meta.harness ?? "pi",
@@ -106,6 +110,7 @@ export function auditRun(
 		converged: result.converged,
 		stop: result.stop,
 		stopDetail,
+		stopError,
 		iters: result.iters,
 		maxIters: cfg.maxIters,
 		callTimeoutMs: cfg.callTimeoutMs,

@@ -40,6 +40,12 @@ const WORKER = "ledger-worker";
 type Phase = "plan" | "ideate" | "manage" | "work" | "review" | "finalize";
 const MANAGER_TURNS = 8;
 const WORKER_TURNS = 30;
+/**
+ * The plan-call failure categories worth one retry: a spawn that was accepted and
+ * whose agent failed (or failed unclassified) may succeed on a fresh agent, while a
+ * timeout, a refusal and an abort are terminal for the run.
+ */
+const RETRYABLE_PLAN_DETAILS: readonly SpawnFailureDetail[] = ["agent-error", "other"];
 /** How often the gate's status label advances while the gate command runs. */
 const GATE_TICK_MS = 1000;
 
@@ -53,12 +59,21 @@ export interface LoopResult {
 	/** Why the loop stopped, for the hand-off block. */
 	stop: "done" | "budget" | "no-progress" | "spawn-failure" | "unconverged" | "aborted";
 	/**
-	 * For `stop:"spawn-failure"`, which RPC failure branch ended the run: the first
-	 * plan failure's or the second consecutive worker failure's category (the first
-	 * failure's category is discarded), defaulted to "other" when the spawn result
-	 * carries none. Undefined on every other stop -- the audit row writes null there.
+	 * For `stop:"spawn-failure"`, which RPC failure branch ended the run: the last
+	 * plan attempt's or the second consecutive worker failure's category (the earlier
+	 * failures' categories are discarded, and the plan is retried once when its first
+	 * failure was retryable), defaulted to "other" when the spawn result carries none.
+	 * Undefined on every other stop -- the audit row writes null there.
 	 */
 	stopDetail?: SpawnFailureDetail;
+	/**
+	 * For `stop:"spawn-failure"`, the error line of the spawn that ended the run --
+	 * its whitespace collapsed to a single line and capped at `MAX_ERROR_TEXT`
+	 * characters. In a best-of-N round where every candidate failed it is that round's
+	 * first-settled failure, the same reply `stopDetail` came from. Undefined on every
+	 * other stop -- the audit row writes null there.
+	 */
+	stopError?: string;
 	notes: string;
 	tasks: Task[];
 	/** The model the manager role ran on, or null when it ran on the session model. */
@@ -319,11 +334,18 @@ async function runRounds(
 		ledger.setTasksJson(tasks);
 		firstResult = SUPPLIED_PLAN_RESULT;
 	} else {
-		// 1. Manager plan.
+		// 1. Manager plan, retried once when its first attempt failed retryably. The
+		// retry goes through the same `call`, so `calls`, the manager timing tally and
+		// the ledger each count both attempts.
 		onProgress(0, "planning");
-		const planReply = await call(MANAGER, planPrompt(task), cfg.managerThinking, MANAGER_TURNS, "plan");
+		const planCall = () => call(MANAGER, planPrompt(task), cfg.managerThinking, MANAGER_TURNS, "plan");
+		let planReply = await planCall();
 		if (signal?.aborted) return abort(calls, tokens);
-		if (!planReply.ok) return spawnFailure(calls, tokens, ledger, planReply.detail);
+		if (!planReply.ok && RETRYABLE_PLAN_DETAILS.includes(planReply.detail ?? "other")) {
+			planReply = await planCall();
+			if (signal?.aborted) return abort(calls, tokens);
+		}
+		if (!planReply.ok) return spawnFailure(calls, tokens, ledger, planReply.detail, planReply.error);
 		const planSec = sections(planReply.text ?? "");
 		ledger.setPlan(planSec.PLAN ?? planReply.text ?? "");
 		tasks = parseTasks(planSec.TASKS ?? "", LIST_CAP);
@@ -516,7 +538,18 @@ async function runRounds(
 					if ("aborted" in ran) return ran.aborted;
 					gate = ran.verdict;
 				}
-				return finish(false, iters, calls, tokens, gate, "spawn-failure", ledger, tasks, worker.detail);
+				return finish(
+					false,
+					iters,
+					calls,
+					tokens,
+					gate,
+					"spawn-failure",
+					ledger,
+					tasks,
+					worker.detail,
+					worker.error,
+				);
 			}
 			// Reissue the same task next iteration. Clear prevNext so the identical
 			// task does not read as no-progress -- a transient spawn failure is not
@@ -625,7 +658,7 @@ interface ManageOut {
 }
 
 /** What the loop reads from a worker call: a spawn result, or its stand-in for a fan-out round. */
-type WorkerReply = Pick<SpawnResult, "ok" | "text" | "detail">;
+type WorkerReply = Pick<SpawnResult, "ok" | "text" | "detail" | "error">;
 
 function addOnce(list: string[], item: string): void {
 	if (!list.includes(item)) list.push(item);
@@ -709,6 +742,25 @@ function describe(role: string, model: string | null, label: string): string {
 	return model ? `${role} (${model}, ${label})` : `${role} (${label})`;
 }
 
+/** The cap on a spawn error line carried out of the loop. */
+const MAX_ERROR_TEXT = 500;
+
+/**
+ * The single-line form of a spawn's error text, for the loop result: every run of
+ * whitespace (including newlines and tabs) collapses to one space and the result is
+ * trimmed, then truncated to `MAX_ERROR_TEXT` characters with a trailing ellipsis.
+ * Truncation counts characters, not UTF-16 code units, so it never splits a surrogate
+ * pair.
+ *
+ * @returns the line, or undefined when there is no error text left to show.
+ */
+function errorText(error?: string): string | undefined {
+	const line = error?.replace(/\s+/g, " ").trim();
+	if (!line) return undefined;
+	const chars = Array.from(line);
+	return chars.length > MAX_ERROR_TEXT ? `${chars.slice(0, MAX_ERROR_TEXT).join("")}…` : line;
+}
+
 function finish(
 	converged: boolean,
 	iters: number,
@@ -719,11 +771,24 @@ function finish(
 	ledger: Ledger,
 	tasks: Task[],
 	stopDetail?: SpawnFailureDetail,
+	stopError?: string,
 ): RoundsResult {
-	// Only a spawn-failure stop carries a category; unclassified failures default
-	// to "other" here so the audit row always has a concrete value.
+	// Only a spawn-failure stop carries a category or an error line; unclassified
+	// failures default to "other" here so the audit row always has a concrete value.
 	const detail = stop === "spawn-failure" ? (stopDetail ?? "other") : undefined;
-	return { converged, iters, calls, tokens, gate, stop, stopDetail: detail, notes: ledger.notes(), tasks };
+	const error = stop === "spawn-failure" ? errorText(stopError) : undefined;
+	return {
+		converged,
+		iters,
+		calls,
+		tokens,
+		gate,
+		stop,
+		stopDetail: detail,
+		stopError: error,
+		notes: ledger.notes(),
+		tasks,
+	};
 }
 
 /**
@@ -746,7 +811,13 @@ function abort(calls: number, tokens: number, iters = 0, gate: GateVerdict | nul
 	return { converged: false, iters, calls, tokens, gate, stop: "aborted", notes: "", tasks: [] };
 }
 
-function spawnFailure(calls: number, tokens: number, ledger: Ledger, detail?: SpawnFailureDetail): RoundsResult {
+function spawnFailure(
+	calls: number,
+	tokens: number,
+	ledger: Ledger,
+	detail?: SpawnFailureDetail,
+	error?: string,
+): RoundsResult {
 	return {
 		converged: false,
 		iters: 0,
@@ -755,6 +826,7 @@ function spawnFailure(calls: number, tokens: number, ledger: Ledger, detail?: Sp
 		gate: null,
 		stop: "spawn-failure",
 		stopDetail: detail ?? "other",
+		stopError: errorText(error),
 		notes: ledger.notes(),
 		tasks: [],
 	};

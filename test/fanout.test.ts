@@ -41,6 +41,8 @@ function managerReply(status: "continue" | "done", next: string, mode?: string):
 
 const ok = (text: string): SpawnResult => ({ ok: true, text });
 const failed = (): SpawnResult => ({ ok: false, error: "boom", detail: "agent-error" });
+/** A failure that carries no failure category -- the shape `other` stands for. */
+const failedUnclassified = (error: string): SpawnResult => ({ ok: false, error });
 const after = <T>(ms: number, value: T): Promise<T> => new Promise((done) => setTimeout(() => done(value), ms));
 /** A timer can fire a millisecond or so early against two `Date.now()` readings, so lower bounds on a delay allow this much slack per call. */
 const TIMER_SLACK_MS = 5;
@@ -70,6 +72,8 @@ const isWork = (c: Call) => c.label === "work" || isCandidate(c);
 const candidateIndex = (c: Call) => Number(/^work (\d+)\//.exec(c.label)?.[1]);
 
 interface Script {
+	/** The reply to the nth (1-based) plan call; defaults to the standing plan reply. */
+	plan?: (n: number) => SpawnResult;
 	/** The reply to the nth (1-based) manage or review call. */
 	manage: (n: number) => string;
 	/** The reply to a worker in the work phase, serial or candidate. */
@@ -80,12 +84,13 @@ interface Script {
 
 function stubSpawn(script: Script, calls: Call[]): SpawnFn {
 	let manages = 0;
+	let plans = 0;
 	return async (o) => {
 		const label = /\(([^)]*)\)$/.exec(o.description)?.[1] ?? "";
 		const call: Call = { type: o.type, label, cwd: o.cwd ?? "", prompt: o.prompt, signal: o.signal };
 		calls.push(call);
 		await after(o.type === "ledger-worker" ? (script.latency?.worker ?? 0) : (script.latency?.manager ?? 0), null);
-		if (label === "plan") return ok(PLAN);
+		if (label === "plan") return script.plan ? script.plan(++plans) : ok(PLAN);
 		if (label === "ideate") return ok(IDEAS);
 		if (isManage(call)) return ok(script.manage(++manages));
 		if (isWork(call)) return script.work ? script.work(call) : ok(WORKED);
@@ -447,8 +452,11 @@ async function case5AllFail(): Promise<void> {
 		},
 	});
 	check(
-		"5 all fail: two rounds stop with spawn-failure",
-		run.result.stop === "spawn-failure" && run.result.iters === 2 && run.result.stopDetail === "agent-error",
+		"5 all fail: two rounds stop with spawn-failure carrying the worker's error text",
+		run.result.stop === "spawn-failure" &&
+			run.result.iters === 2 &&
+			run.result.stopDetail === "agent-error" &&
+			run.result.stopError === "boom",
 		run.result,
 	);
 	check(
@@ -1375,6 +1383,85 @@ async function case26AskLatchAndUnknownAnswer(): Promise<void> {
 	);
 }
 
+/** The plan calls a run made, in order. */
+const planCallsOf = (run: Run) => run.calls.filter((c) => c.label === "plan").length;
+
+/**
+ * The round-0 plan retry on the failure category no harness names: a plan reply that
+ * fails with no `detail` at all (the `other` default), once and then fine, twice, and
+ * with two different failures so the reported one is the last.
+ */
+async function case27PlanRetry(): Promise<void> {
+	const recovered = await runCase({
+		name: "c27a",
+		repo: newRepo("c27a"),
+		config: "off",
+		script: {
+			plan: (n) => (n === 1 ? failedUnclassified("agent  died\n\nmid  sentence") : ok(PLAN)),
+			manage: (n) =>
+				n < 3 ? managerReply("continue", `step ${n}`, "best-of-n: ignored") : managerReply("done", ""),
+			work: passingWorker,
+		},
+	});
+	check(
+		"27 plan retry: a category-less plan failure is retried once and the run converges",
+		planCallsOf(recovered) === 2 && recovered.result.converged && recovered.result.stopError === undefined,
+		[planCallsOf(recovered), recovered.result.stop, recovered.result.stopError],
+	);
+	check(
+		"27 plan retry: the failed attempt still counts in the manager tally",
+		recovered.result.timing.managerCalls === recovered.calls.filter((c) => c.type === "ledger-manager").length,
+		[recovered.result.timing.managerCalls, recovered.calls.length],
+	);
+
+	const terminal = await runCase({
+		name: "c27b",
+		repo: newRepo("c27b"),
+		config: "off",
+		script: {
+			plan: () => failedUnclassified("no category at all"),
+			manage: () => managerReply("continue", "never reached"),
+		},
+	});
+	check(
+		"27 plan retry: a twice-failed plan stops as spawn-failure in the other category with its error line",
+		planCallsOf(terminal) === 2 &&
+			terminal.result.stop === "spawn-failure" &&
+			terminal.result.stopDetail === "other" &&
+			terminal.result.stopError === "no category at all",
+		[planCallsOf(terminal), terminal.result.stop, terminal.result.stopDetail, terminal.result.stopError],
+	);
+	check(
+		"27 plan retry: the failed plan call starts no worker and gates nothing",
+		terminal.calls.filter(isWork).length === 0 && terminal.result.gate === null,
+		[terminal.calls.map((c) => c.label), terminal.result.gate],
+	);
+
+	// The two attempts fail differently, so a stop that read the first reply instead of
+	// the last would be caught here: the category and the error line must both come from
+	// the attempt that ended the run.
+	const lastAttempt = await runCase({
+		name: "c27c",
+		repo: newRepo("c27c"),
+		config: "off",
+		script: {
+			plan: (n) =>
+				n === 1
+					? failedUnclassified("first attempt")
+					: { ok: false, error: "second attempt", detail: "timeout" as const },
+			manage: () => managerReply("continue", "never reached"),
+		},
+	});
+	check(
+		"27 plan retry: the stop reports the last attempt, not the first",
+		planCallsOf(lastAttempt) === 2 &&
+			lastAttempt.result.stop === "spawn-failure" &&
+			lastAttempt.result.stopDetail === "timeout" &&
+			lastAttempt.result.stopError === "second attempt",
+		[planCallsOf(lastAttempt), lastAttempt.result.stop, lastAttempt.result.stopDetail, lastAttempt.result.stopError],
+	);
+}
+
 async function main(): Promise<void> {
 	mkdirSync(root, { recursive: true });
 	writeFileSync(configFile, `stateDir = "${stateDir}"\nproviders = ["test"]\n`);
@@ -1406,6 +1493,7 @@ async function main(): Promise<void> {
 	await case24AskAbort();
 	case25LowerAsk();
 	await case26AskLatchAndUnknownAnswer();
+	await case27PlanRetry();
 
 	rmSync(root, { recursive: true, force: true });
 	console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);

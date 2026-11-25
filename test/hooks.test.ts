@@ -140,8 +140,9 @@ const rowsIn = (stateDir: string, role = "brief"): Record<string, any>[] =>
 /**
  * The `stop` reason of the most recent `run` audit row -- the durable, observable
  * record of why a loop ended. A spawn that times out is a not-ok call, so it
- * surfaces here as `spawn-failure`, and an abort as `aborted`; the spawn's own
- * `timeout` error string only ever reaches the per-turn ledger files.
+ * surfaces here as `spawn-failure`, and an abort as `aborted`; the spawn's own error
+ * string reaches the row separately, as the normalized `stopError`, while the full
+ * text stays in the per-turn ledger.
  */
 const lastRunStop = (): string | undefined =>
 	readAudit()
@@ -158,6 +159,17 @@ const lastRunStopDetail = (): string | null | undefined =>
 	readAudit()
 		.filter((x) => x.event === "run")
 		.at(-1)?.stopDetail;
+
+/**
+ * The `stopError` of the most recent `run` audit row -- the one-line, length-capped
+ * error text of the spawn that ended a `spawn-failure` run, so a failed agent is
+ * diagnosable without opening the per-turn ledger. Only `spawn-failure` rows carry
+ * one; every other stop is null, and a row written before the field has it missing.
+ */
+const lastRunStopError = (): string | null | undefined =>
+	readAudit()
+		.filter((x) => x.event === "run")
+		.at(-1)?.stopError;
 
 /** A scripted step: the text a spawned agent returns, or a failure/refusal. */
 interface Step {
@@ -2330,6 +2342,23 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		const fanLines = handoffBlock(repo, { ...result("false"), fanout: summary })
 			.split("\n")
 			.filter((l) => l.startsWith("Fan-out:"));
+		const spawnFailed = handoffBlock(repo, {
+			...result("false"),
+			stop: "spawn-failure" as const,
+			stopDetail: "timeout" as const,
+			stopError: "timeout",
+		});
+		check(
+			"a spawn-failure hand-off names its category in the header and adds the failure line",
+			spawnFailed.includes("stopped (spawn-failure: timeout) without a passing gate") &&
+				spawnFailed.includes("\nFailure: timeout\n"),
+			spawnFailed.slice(0, 260),
+		);
+		check(
+			"a non-spawn-failure hand-off keeps its plain header and gains no Failure line",
+			plain.includes("stopped (unconverged) without a passing gate") && !plain.includes("Failure:"),
+			plain.slice(0, 260),
+		);
 		check(
 			"a fan-out summary adds one Fan-out line with downgrades and escapes only when present",
 			fanLines.length === 1 &&
@@ -3241,22 +3270,95 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		check("the audit row records planSource manager without a plan", managerRow?.planSource === "manager");
 	}
 
-	// --- first-plan agent failure reaches the audit writer with its category ---
+	// --- first-plan agent failure is retried once, then audited with its category ---
 	{
-		// A failed agent payload on the very first call (the plan) exits through
-		// spawnFailure; the row must carry agent-error, not the refused path's category.
+		// A failed agent payload on the plan call is retried once; the second failure
+		// exits through spawnFailure, so the row must carry agent-error, not the
+		// refused path's category, and the failing agent's error text.
 		writeConfig({ gate: "true", maxIters: 4 });
 		const { handlers, ctx, bus } = fresh([{ fail: true, failError: "manager crashed" }], "code");
 		await handlers.input(input("fix it"), ctx);
+		const planDescs = descriptionsFor(bus, "ledger-manager");
 		check(
-			"a first-plan agent failure is audited as stopDetail:agent-error",
-			lastRunStop() === "spawn-failure" && lastRunStopDetail() === "agent-error",
-			`stop=${lastRunStop()} detail=${String(lastRunStopDetail())}`,
+			"a twice-failed plan is audited as stopDetail:agent-error carrying the agent's error text",
+			lastRunStop() === "spawn-failure" &&
+				lastRunStopDetail() === "agent-error" &&
+				lastRunStopError() === "manager crashed",
+			`stop=${lastRunStop()} detail=${String(lastRunStopDetail())} error=${String(lastRunStopError())}`,
 		);
 		check(
-			"the failed plan agent was consumed once and never stopped",
-			consumedOncePerSpawn(bus, 1),
-			`spawned=${bus.spawned.length} ${opLog(bus)}`,
+			"the retry is a second plan call, both consumed and never stopped, with no worker spawned",
+			consumedOncePerSpawn(bus, 2) &&
+				planDescs.every((d) => d?.endsWith(", plan)")) &&
+				descriptionsFor(bus, "ledger-worker").length === 0,
+			`spawned=${bus.spawned.length} ${opLog(bus)} ${planDescs.join(" | ")}`,
+		);
+	}
+
+	// --- a plan call that fails once and succeeds on the retry keeps running ---
+	{
+		// The retry goes through the same call path, so both attempts count in the
+		// manager tally and the run continues to a converged result with no error line.
+		writeConfig({ gate: "true", maxIters: 4 });
+		const script: Step[] = [
+			{ fail: true, failError: "manager crashed" },
+			{ text: PLAN },
+			{ text: IDEATE },
+			{ text: manage("continue", "do the fix") },
+			{ text: worker("solved") },
+			{ text: manage("done", "") },
+		];
+		const { handlers, ctx, bus } = fresh(script, "code");
+		await handlers.input(input("fix it"), ctx);
+		const managerDescs = descriptionsFor(bus, "ledger-manager");
+		const planCalls = managerDescs.filter((d) => d?.endsWith(", plan)"));
+		const row = readAudit()
+			.filter((x) => x.event === "run")
+			.at(-1);
+		check("a plan call that fails then succeeds converges", row?.converged === true, JSON.stringify(row));
+		check("the recovered plan call is the second plan spawn", planCalls.length === 2, managerDescs.join(" | "));
+		check(
+			"both plan attempts count in the manager tally, and a run that recovered carries no stopError",
+			row?.managerCalls === managerDescs.length && row?.stopError === null,
+			`managerCalls=${String(row?.managerCalls)} spawns=${managerDescs.length} error=${String(row?.stopError)}`,
+		);
+	}
+
+	// --- the spawn error line reaching the audit row is one capped line ---
+	{
+		writeConfig({ gate: "true", maxIters: 4 });
+		const messy = fresh([{ fail: true, failError: "agent crashed\n\tat  spawn()\nmore   detail" }], "code");
+		await messy.handlers.input(input("fix it"), messy.ctx);
+		check(
+			"a multi-line spawn error is audited as one whitespace-collapsed line",
+			lastRunStopError() === "agent crashed at spawn() more detail",
+			String(lastRunStopError()),
+		);
+
+		const long = fresh([{ fail: true, failError: "x".repeat(600) }], "code");
+		await long.handlers.input(input("fix it"), long.ctx);
+		check(
+			"a 600-character spawn error is capped at 500 characters plus the ellipsis",
+			lastRunStopError() === `${"x".repeat(500)}…`,
+			`length=${String(lastRunStopError()?.length)}`,
+		);
+
+		// The cap falls inside the astral character, so a code-unit cut would leave a lone
+		// surrogate and the audit line would carry text no JSON reader can render.
+		const astral = fresh([{ fail: true, failError: `${"x".repeat(499)}\u{1F600}tail` }], "code");
+		await astral.handlers.input(input("fix it"), astral.ctx);
+		check(
+			"the 500-character cap never splits a character in half",
+			lastRunStopError() === `${"x".repeat(499)}\u{1F600}…`,
+			JSON.stringify(lastRunStopError()?.slice(497)),
+		);
+
+		const blank = fresh([{ fail: true, failError: "   \n " }], "code");
+		await blank.handlers.input(input("fix it"), blank.ctx);
+		check(
+			"a blank spawn error leaves no stopError while its category is still audited",
+			lastRunStopError() === null && lastRunStopDetail() === "agent-error",
+			`error=${String(lastRunStopError())} detail=${String(lastRunStopDetail())}`,
 		);
 	}
 
@@ -3484,6 +3586,11 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		);
 		check("aborted run drops the turn", r?.action === "handled", JSON.stringify(r));
 		check(
+			"an aborted plan call is never retried and audits no error line",
+			bus.spawned.length === 1 && lastRunStop() === "aborted" && lastRunStopError() === null,
+			`spawned=${bus.spawned.length} stop=${String(lastRunStop())} error=${String(lastRunStopError())}`,
+		);
+		check(
 			"aborted run is still audited (stop:aborted)",
 			readAudit().some((x) => x.event === "run" && x.stop === "aborted"),
 			JSON.stringify(
@@ -3550,6 +3657,11 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		const timeoutRow = readAudit()
 			.filter((x) => x.event === "run")
 			.at(-1);
+		check(
+			"a timed-out plan call is never retried and carries the timeout's error line",
+			bus.spawned.length === 1 && timeoutRow?.stopError === "timeout",
+			`spawned=${bus.spawned.length} error=${String(timeoutRow?.stopError)}`,
+		);
 		check(
 			"the timeout row carries the callTimeoutMs and maxIters it ran under",
 			timeoutRow?.callTimeoutMs === 15 && timeoutRow?.maxIters === 4,
@@ -3703,9 +3815,9 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			String(lastRunStop()),
 		);
 		check(
-			"the final consecutive failure's category wins over the first's",
-			lastRunStopDetail() === "agent-error",
-			String(lastRunStopDetail()),
+			"the final consecutive failure's category and error text win over the first's",
+			lastRunStopDetail() === "agent-error" && lastRunStopError() === "crashed",
+			`detail=${String(lastRunStopDetail())} error=${String(lastRunStopError())}`,
 		);
 		check(
 			"the timed-out worker is stopped then consumed; the failed worker consumed once",
@@ -3725,9 +3837,11 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		const { handlers, ctx, bus } = fresh([{ spawnRefused: true, refuseError: "quota exceeded" }], "code");
 		await handlers.input(input("fix it"), ctx);
 		check(
-			"a refused first plan is audited as stop:spawn-failure with stopDetail:refused",
-			lastRunStop() === "spawn-failure" && lastRunStopDetail() === "refused",
-			`stop=${lastRunStop()} detail=${String(lastRunStopDetail())}`,
+			"a refused first plan is audited once as stop:spawn-failure with stopDetail:refused and the refusal text",
+			lastRunStop() === "spawn-failure" &&
+				lastRunStopDetail() === "refused" &&
+				lastRunStopError() === "quota exceeded",
+			`stop=${lastRunStop()} detail=${String(lastRunStopDetail())} error=${String(lastRunStopError())}`,
 		);
 		check(
 			"a refused plan spawn stops and consumes no id that never existed",

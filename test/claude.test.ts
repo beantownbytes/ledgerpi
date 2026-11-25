@@ -256,11 +256,19 @@ async function testEmptyManagerAnswer(): Promise<void> {
 		},
 		["--gate=true"],
 	);
-	check("an empty plan starts no worker", steps(played).length === 1, steps(played));
+	const all = steps(played);
+	check(
+		"an empty manager answer is retried once as a second plan call and starts no worker",
+		all.length === 2 && all.every((s) => s.role === "manager" && s.description.includes("plan")),
+		all,
+	);
 	const row = lastRow();
 	check(
-		"an empty manager answer is audited as a failed agent",
-		row.stop === "spawn-failure" && row.stopDetail === "agent-error",
+		"a twice-empty manager answer is audited as a failed agent carrying its error text",
+		row.stop === "spawn-failure" &&
+			row.stopDetail === "agent-error" &&
+			row.stopError === "the manager returned no answer" &&
+			row.managerCalls === 2,
 		row,
 	);
 }

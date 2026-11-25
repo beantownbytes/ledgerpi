@@ -86,7 +86,8 @@ changes.
 
 - **run** (one per completed loop, from any entry point): `{ t, event:"run", source,
   harness:"pi"|"claude", entry:"input"|"tool"|"command", session, provider, model,
-  managerModel, workerModel, planSource, classified, converged, stop, stopDetail, iters,
+  managerModel, workerModel, planSource, classified, converged, stop, stopDetail,
+  stopError, iters,
   maxIters, callTimeoutMs, calls, tokens, managerTokens, workerTokens,
   gate:{command,ran,passed}|null, cwd, repoUrl, branch, headStart, headEnd, durationMs,
   managerMs, workerMs, gateMs, managerCalls, workerCalls, gateRuns,
@@ -114,7 +115,11 @@ changes.
   `stopDetail: null` -- rows from a version predating the field have the key missing, and
   that legacy shape aggregates as `unknown`, a distinct bucket from `other`. A malformed
   (non-string or empty) `stopDetail` also aggregates as `unknown`, reported rather than
-  crashing or double-counting. `provider`/`model`
+  crashing or double-counting. `stopError` sits beside it on those same rows: the error line
+  of the spawn that ended the run, whitespace-collapsed to one line and capped at 500
+  characters, so the row stays an aggregate while the full text stays in that run's per-turn
+  ledger. Every other stop writes `stopError: null`, and a row whose spawn carried no text or
+  predates the field aggregates as `none` in the breakdown. `provider`/`model`
   are nullable. `gate` is `null` when no gate *result* was recorded for the run -- that
   happens both when no gate was detected in the repo and when the loop stopped before
   reaching the gate (`aborted`, `no-progress`, or a `spawn-failure` before the first
@@ -201,8 +206,9 @@ fields as an array and serializes with `@tsv` rather than interpolating raw `\t`
 caller-supplied label containing a tab, newline, carriage return, or backslash is escaped
 and cannot shift a column or split a row. The count-sorting recipes sort on the count
 column: field 3 for the passthrough mix (a source column precedes the count), field 5 for
-the stop mix and spawn-failure breakdown (source, `maxIters=`, and `callTimeoutMs=`
-precede the stop and the count).
+the stop mix (source, `maxIters=`, and `callTimeoutMs=` precede the stop and the count),
+and field 6 for the spawn-failure breakdown (the `stopDetail` category and the `stopError`
+line also precede its count).
 
 The convergence, stop-mix, and spawn-failure recipes also segment by the run's budget.
 Each defines `def bud(f)`, which maps a numeric `maxIters`/`callTimeoutMs` to its
@@ -249,14 +255,19 @@ pooled with a same-model run of the same session model.
     [.[]|select(.event=="run")]|group_by([src,bud(.maxIters),bud(.callTimeoutMs),.stop])[]|[(.[0]|src),"maxIters=\(.[0]|bud(.maxIters))","callTimeoutMs=\(.[0]|bud(.callTimeoutMs))","\(.[0].stop)","\(length)"]|@tsv' | sort -t$'\t' -k5 -rn
   ```
 - Spawn-failure breakdown (why `stop:"spawn-failure"` runs failed; the top-level stop
-  mix above keeps the bucket as one row per budget, this recipe splits it by `stopDetail`,
-  so a `timeout` cluster can be read against the `callTimeoutMs` it ran under):
+  mix above keeps the bucket as one row per budget, this recipe splits it by `stopDetail`
+  and by the `stopError` line under it -- `none` for a row that predates the field or whose
+  spawn carried no text -- so a `timeout` cluster can be read against the `callTimeoutMs`
+  it ran under and an `agent-error` cluster against what the agent actually reported). The
+  error-line column is that literal line, so two failures whose text differs only in a
+  timing or identifier fragment land in separate rows; read a cluster as several rows
+  before calling it several distinct problems):
   ```bash
   jq -R 'fromjson? | select(type=="object")' "$LOG" | jq -s -r '
     def ws: "[\\t\\n\\x0b\\x0c\\r \\x{a0}\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}\\x{feff}]";
     def src: (if (.source|type)=="string" then (.source|gsub("^"+ws+"+|"+ws+"+$";"")) else "" end) | if .=="" then "unknown" else . end;
     def bud(f): f|if type=="number" then tostring else "unknown" end;
-    [.[]|select(.event=="run" and .stop=="spawn-failure")]|map(. as $r|($r.stopDetail as $d|if ($d|type)=="string" and ($d|length)>0 then $d else "unknown" end) as $c|{s:($r|src),m:($r|bud(.maxIters)),o:($r|bud(.callTimeoutMs)),c:$c})|group_by([.s,.m,.o,.c])[]|[(.[0].s),"maxIters=\(.[0].m)","callTimeoutMs=\(.[0].o)","\(.[0].c)","\(length)"]|@tsv' | sort -t$'\t' -k5 -rn
+    [.[]|select(.event=="run" and .stop=="spawn-failure")]|map(. as $r|($r.stopDetail as $d|if ($d|type)=="string" and ($d|length)>0 then $d else "unknown" end) as $c|($r.stopError as $e|if ($e|type)=="string" and ($e|length)>0 then $e else "none" end) as $x|{s:($r|src),m:($r|bud(.maxIters)),o:($r|bud(.callTimeoutMs)),c:$c,e:$x})|group_by([.s,.m,.o,.c,.e])[]|[(.[0].s),"maxIters=\(.[0].m)","callTimeoutMs=\(.[0].o)","\(.[0].c)","\(.[0].e)","\(length)"]|@tsv' | sort -t$'\t' -k6 -rn
   ```
 - Gate coverage and outcome (one row per source; `badGate` is a run whose `gate` is
   present but not an object; only object gates are inspected, so a bad one is reported,
@@ -363,7 +374,8 @@ and never recommend an organic tuning change off benchmark-only rows:
   naming a knob: `timeout` points at `callTimeoutMs` being too low or a slow provider
   (raise the budget or investigate latency), while `refused`/`agent-error` point at the
   RPC layer or provider (auth, capacity, broken model) -- investigate those, do not
-  drop a model from its provider's allowlist off them alone. `aborted` never appears as a spawn-failure detail
+  drop a model from its provider's allowlist off them alone, and read the `stopError`
+  line each `agent-error` row carries before naming a provider fault at all. `aborted` never appears as a spawn-failure detail
   (a user abort is its own top-level stop) -- keep it out of provider-health reasoning.
   `other`/`unknown` are unclassified: report them as a provenance gap, not a verdict.
   Read a `timeout` cluster against its `callTimeoutMs=` bucket: a cluster that stops

@@ -31,11 +31,17 @@ export function handoffBlock(cwd: string, result: LoopResult): string {
 	const gate = result.gate?.ran && !multiLine ? `${verdict} (\`${command}\`)` : verdict;
 	const gateBlock = result.gate?.ran && multiLine ? [`Gate command:${gateCommandText(command).trimEnd()}`] : [];
 
+	// A spawn-failure header names its category, so a timeout reads differently from a
+	// refusal without opening the ledger. Every other stop keeps its plain label.
+	const stopLabel =
+		result.stop === "spawn-failure" && result.stopDetail ? `spawn-failure: ${result.stopDetail}` : result.stop;
+	const failure = result.stopError ? [`Failure: ${result.stopError}`] : [];
+
 	const header = result.converged
 		? "A ledger-based manager-worker loop ran under this request and converged. The changes are already in the working tree."
 		: result.gate?.ran && result.gate.passed
-			? `A ledger-based manager-worker loop ran under this request and stopped (${result.stop}) with a passing gate, but the task was not confirmed done. The changes are in the working tree and may be incomplete.`
-			: `A ledger-based manager-worker loop ran under this request and stopped (${result.stop}) without a passing gate. Partial changes are in the working tree.`;
+			? `A ledger-based manager-worker loop ran under this request and stopped (${stopLabel}) with a passing gate, but the task was not confirmed done. The changes are in the working tree and may be incomplete.`
+			: `A ledger-based manager-worker loop ran under this request and stopped (${stopLabel}) without a passing gate. Partial changes are in the working tree.`;
 
 	const guidance = result.converged
 		? "Verify the change briefly (read the diff, trust the gate result), then answer the user. Do not redo the work."
@@ -44,6 +50,7 @@ export function handoffBlock(cwd: string, result: LoopResult): string {
 	return [
 		"\n\n<ledgerpi-result>",
 		header,
+		...failure,
 		"",
 		`Gate: ${gate}. Rounds: ${result.iters}. Sub-agent calls: ${result.calls}. Tokens: ${result.tokens}.`,
 		...gateBlock,
