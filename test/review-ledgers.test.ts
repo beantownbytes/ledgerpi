@@ -94,10 +94,12 @@ const run = (
 	gateVal: LoopResult["gate"],
 	detail?: LoopResult["stopDetail"],
 	timing: RoleTiming = ZERO_TIMING,
+	error?: string,
 ): LoopResult => ({
 	converged,
 	stop,
 	stopDetail: detail,
+	stopError: error,
 	iters,
 	calls: 0,
 	tokens: 0,
@@ -187,6 +189,20 @@ auditRun(cfg, meta("cerebras", "gemma"), run(false, "spawn-failure", 0, null, "a
 	calls: 1,
 	tokens: 90,
 });
+// t18: the same source, budget and category as t15 but with an error line, so the
+// breakdown's error column splits one category two ways instead of collapsing them.
+auditRun(
+	cfg,
+	meta("cerebras", "gemma"),
+	run(false, "spawn-failure", 0, null, "agent-error", ZERO_TIMING, "manager crashed"),
+	{
+		task: "t18",
+		durationMs: 100,
+		classified: null,
+		calls: 1,
+		tokens: 101,
+	},
+);
 // Two more spawn-failure rows whose details are mutated below: t16 -> null and
 // t17 -> empty string, so the breakdown has every legacy shape (missing, null,
 // empty, non-string) that must aggregate as unknown.
@@ -385,7 +401,7 @@ const canon = readFileSync(fixLog, "utf8")
 	.split("\n")
 	.filter(Boolean)
 	.map((l) => JSON.parse(l) as Record<string, unknown>);
-check("writers produced the expected number of canonical records", canon.length === 41, `count=${canon.length}`);
+check("writers produced the expected number of canonical records", canon.length === 42, `count=${canon.length}`);
 check(
 	"every run row carries a fanout key, null when the loop result has no summary",
 	canon.filter((r) => r["event"] === "run").every((r) => "fanout" in r && r["fanout"] === null),
@@ -532,10 +548,11 @@ const t8 = corpus.find((r) => r["event"] === "run" && r["task"] === "t8");
 delete t8?.["tokens"];
 const t5 = corpus.find((r) => r["event"] === "run" && r["task"] === "t5");
 delete t5?.["converged"];
-// A legacy row: written before the stopDetail field existed, so the key is missing.
-// The aggregation must count it as unknown, distinct from other and from every
-// tagged category.
+// A legacy row: written before the stopDetail and stopError fields existed, so both
+// keys are missing. The aggregation must count it as unknown with no error line,
+// distinct from other and from every tagged category.
 delete t5?.["stopDetail"];
+delete t5?.["stopError"];
 // The same legacy row also predates the role fields: it aggregates as manager and
 // worker unknown, distinct from session (an explicit null).
 delete t5?.["managerModel"];
@@ -707,12 +724,13 @@ for (const r of runs) {
 	expectedStop[k] = (expectedStop[k] ?? 0) + 1;
 }
 // Spawn-failure breakdown, computed the way its recipe does: a present non-empty
-// string stopDetail is the category, anything else (missing/null/empty/non-string)
-// is unknown.
+// string stopDetail is the category and a present non-empty stopError the error line,
+// anything else (missing/null/empty/non-string) is unknown / none.
 const normalizeDetail = (d: unknown) => (typeof d === "string" && d.length > 0 ? d : "unknown");
+const normalizeError = (e: unknown) => (typeof e === "string" && e.length > 0 ? e : "none");
 const expectedSpawnDetail: Record<string, number> = {};
 for (const r of runs.filter((r) => r["stop"] === "spawn-failure")) {
-	const k = `${srcOf(r)}\t${budgetOf(r)}\t${normalizeDetail(r["stopDetail"])}`;
+	const k = `${srcOf(r)}\t${budgetOf(r)}\t${normalizeDetail(r["stopDetail"])}\t${normalizeError(r["stopError"])}`;
 	expectedSpawnDetail[k] = (expectedSpawnDetail[k] ?? 0) + 1;
 }
 const expectedGate: Record<
@@ -1031,8 +1049,8 @@ try {
 	);
 	const stopBySource = acrossBudgets(stop);
 	check(
-		"the top-level stop mix keeps spawn-failure as one bucket per source and budget (organic=9, benchmark=2 across budgets)",
-		stopBySource["organic\tspawn-failure"] === 9 && stopBySource["benchmark\tspawn-failure"] === 2,
+		"the top-level stop mix keeps spawn-failure as one bucket per source and budget (organic=10, benchmark=2 across budgets)",
+		stopBySource["organic\tspawn-failure"] === 10 && stopBySource["benchmark\tspawn-failure"] === 2,
 		`organic=${stopBySource["organic\tspawn-failure"]} benchmark=${stopBySource["benchmark\tspawn-failure"]}`,
 	);
 	check(
@@ -1046,24 +1064,31 @@ try {
 	const spawnDetail: Record<string, number> = {};
 	for (const line of spawnDetailOut.split("\n")) {
 		if (!line.trim()) continue;
-		const [source, maxIters, callTimeoutMs, detail, count] = line.split("\t");
-		if (source) spawnDetail[`${source}\t${maxIters}\t${callTimeoutMs}\t${detail}`] = Number(count);
+		const [source, maxIters, callTimeoutMs, detail, error, count] = line.split("\t");
+		if (source) spawnDetail[`${source}\t${maxIters}\t${callTimeoutMs}\t${detail}\t${error}`] = Number(count);
 	}
 	check(
-		"spawn-failure breakdown matches (every category + legacy/malformed as unknown)",
+		"spawn-failure breakdown matches (every category + error line + legacy/malformed as unknown)",
 		sameMap(spawnDetail, expectedSpawnDetail),
 		`got=${JSON.stringify(spawnDetail)} want=${JSON.stringify(expectedSpawnDetail)}`,
 	);
 	const detailBySource = acrossBudgets(spawnDetail);
 	check(
 		"a malformed stopDetail folds into unknown, not into a bogus category",
-		acrossBudgets(expectedSpawnDetail)["organic\tunknown"] === 4 && detailBySource["organic\tunknown"] === 4,
-		`unknown=${detailBySource["organic\tunknown"]}`,
+		acrossBudgets(expectedSpawnDetail)["organic\tunknown\tnone"] === 4 &&
+			detailBySource["organic\tunknown\tnone"] === 4,
+		`unknown=${detailBySource["organic\tunknown\tnone"]}`,
+	);
+	check(
+		"the breakdown splits one category by its error line, so a repeated agent failure is diagnosable",
+		spawnDetail[`organic\t${DEFAULT_BUDGET}\tagent-error\tmanager crashed`] === 1 &&
+			(spawnDetail[`organic\t${DEFAULT_BUDGET}\tagent-error\tnone`] ?? 0) >= 1,
+		JSON.stringify(spawnDetail),
 	);
 	check(
 		"a timeout under a raised callTimeoutMs is its own breakdown row, apart from default-budget timeouts",
-		spawnDetail[`organic\tmaxIters=${cfg.maxIters}\tcallTimeoutMs=900000\ttimeout`] === 1 &&
-			(spawnDetail[`organic\t${DEFAULT_BUDGET}\ttimeout`] ?? 0) > 0,
+		spawnDetail[`organic\tmaxIters=${cfg.maxIters}\tcallTimeoutMs=900000\ttimeout\tnone`] === 1 &&
+			(spawnDetail[`organic\t${DEFAULT_BUDGET}\ttimeout\tnone`] ?? 0) > 0,
 		JSON.stringify(spawnDetail),
 	);
 	const detailSum = Object.values(spawnDetail).reduce((a, b) => a + b, 0);
@@ -1278,13 +1303,16 @@ try {
 			.map((l) => JSON.parse(l) as Record<string, unknown>);
 		ctrlRows.forEach((r, i) => {
 			r["source"] = ctrlSources[Math.floor(i / 2)];
+			// The error line is free text a sub-agent produced, so it is the field most
+			// likely to carry a delimiter: `@tsv` must escape it, never shift a column.
+			if (r["event"] === "run") r["stopError"] = "crash\tat line\n2";
 		});
 		writeFileSync(ctrlLog, `${ctrlRows.map((r) => JSON.stringify(r)).join("\n")}\n`, "utf8");
 		const ctrlBefore = readFileSync(ctrlLog);
 		const widths: Record<string, number> = {
 			convergence: 11,
 			stop: 5,
-			spawnDetail: 5,
+			spawnDetail: 6,
 			reason: 3,
 			gate: 7,
 			classifierSpend: 8,

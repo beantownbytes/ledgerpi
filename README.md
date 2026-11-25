@@ -645,8 +645,8 @@ audit log at `auditLog` (default `<stateDir>/runs.jsonl`), one JSON row per run:
 ```
 { "t", "event": "run", "source", "entry": "input"|"tool"|"command", "harness": "pi"|"claude",
   "session", "provider", "model", "managerModel", "workerModel", "planSource", "classified",
-  "converged", "stop", "stopDetail", "iters", "maxIters", "callTimeoutMs", "calls", "tokens",
-  "managerTokens", "workerTokens", "gate": { "command", "ran", "passed" },
+  "converged", "stop", "stopDetail", "stopError", "iters", "maxIters", "callTimeoutMs",
+  "calls", "tokens", "managerTokens", "workerTokens", "gate": { "command", "ran", "passed" },
   "fanout": { "setting", "max", "rounds", "downgrades", "escapes", "asked", "advised" } | null,
   "cwd", "repoUrl", "branch", "headStart", "headEnd", "durationMs",
   "managerMs", "workerMs", "gateMs", "managerCalls", "workerCalls", "gateRuns", "task" }
@@ -706,14 +706,23 @@ from so a review can separate real traffic from synthetic A/B activity.
 
 `stop` is why the loop ended. On `stop: "spawn-failure"` rows, `stopDetail` names
 the RPC failure branch: `aborted`, `timeout`, `refused`, `agent-error`, or `other`
-(an unclassified failure). Every other stop writes `stopDetail: null`; rows from a
-version predating the field omit the key and aggregate as `unknown` in the
-review-ledgers breakdown.
+(an unclassified failure), and `stopError` carries the error line of the spawn that
+ended the run -- whitespace collapsed to a single line and capped at 500 characters,
+so the row stays an aggregate while the full text stays in that run's per-turn
+ledger. In a best-of-N round where every candidate failed, both fields describe that
+round's first-settled candidate, not the last one to report. A spawn whose error was
+empty writes `stopError: null`, and so does every other stop; rows from a version
+predating the fields omit the keys and aggregate as `unknown` (categories) or `none`
+(error lines) in the review-ledgers breakdown.
 
 A `spawn-failure` after the loop has started (the second consecutive worker failure)
 re-runs the configured gate, so the row's `gate` is the fresh verdict on the tree as
 it stands at the stop, not the verdict from an earlier round. A `spawn-failure` before
-the first round (the plan call failing) records `gate: null`.
+the first round (the plan call failing) records `gate: null`. That first plan call is
+retried once when its spawn was accepted and its agent failed (`agent-error`) or failed
+unclassified -- a fresh agent can succeed where an accepted one failed -- and never on a
+timeout, a refusal, or an abort, so the row's `stopDetail` and `stopError` always
+describe the last attempt.
 
 A prompt the classifier declines is recorded as an `event: "passthrough"` row
 (source, entry, session, provider, model, `classified`, `reason`, calls, tokens,
