@@ -28,6 +28,7 @@ import {
 	roleModelsFor,
 	scopeReason,
 } from "../packages/core/src/config.ts";
+import { appendRegularFile } from "../packages/core/src/files.ts";
 import { detectGate, runGate } from "../packages/core/src/gate.ts";
 import {
 	addCandidateWorktree,
@@ -6537,6 +6538,85 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			audit.errors.join(" | "),
 		);
 		rmSync(auditFifo);
+
+		// A torn earlier write leaves an unterminated fragment at the end of a JSON-lines log. The
+		// fragment can only cost itself: the record appended after it has to start on its own line.
+		const fragment = '{"event":"run","provider":"strix","model":"qw';
+		const rec = { event: "run", provider: "strix", model: "qwennova", converged: true };
+		const body = `${JSON.stringify(rec)}\n`;
+
+		const torn = join(root, "append-torn.jsonl");
+		writeFileSync(torn, fragment);
+		appendRegularFile(torn, body, 0o600);
+		const tornText = readFileSync(torn, "utf8");
+		const tornLines = tornText.split("\n");
+		check(
+			"an append restores the newline a torn write left and lands the record on its own line",
+			tornText === `${fragment}\n${body}` &&
+				tornLines.length === 3 &&
+				tornLines[0] === fragment &&
+				JSON.stringify(JSON.parse(tornLines[1])) === JSON.stringify(rec) &&
+				tornLines[2] === "",
+			JSON.stringify(tornText),
+		);
+
+		const seeded = `${JSON.stringify({ event: "seed" })}\n`;
+		const terminated = join(root, "append-terminated.jsonl");
+		writeFileSync(terminated, seeded);
+		appendRegularFile(terminated, body, 0o600);
+		const terminatedText = readFileSync(terminated, "utf8");
+		check(
+			"an append to a file that already ends in a newline adds no blank line",
+			terminatedText === `${seeded}${body}` && !terminatedText.includes("\n\n"),
+			JSON.stringify(terminatedText),
+		);
+
+		const empty = join(root, "append-empty.jsonl");
+		writeFileSync(empty, "");
+		appendRegularFile(empty, body, 0o600);
+		const created = join(root, "append-created.jsonl");
+		appendRegularFile(created, body, 0o600);
+		check(
+			"an append to an empty file writes exactly the body",
+			readFileSync(empty, "utf8") === body,
+			JSON.stringify(readFileSync(empty, "utf8")),
+		);
+		check(
+			"an append to an absent path creates the file holding exactly the body with mode 0600",
+			readFileSync(created, "utf8") === body && (statSync(created).mode & 0o777) === 0o600,
+			`content=${JSON.stringify(readFileSync(created, "utf8"))}`,
+		);
+
+		const auditTorn = join(root, "audit-torn.jsonl");
+		writeFileSync(auditTorn, fragment);
+		const auditRepair = captureErrors(() =>
+			auditPassthrough({ ...cfg, auditLog: auditTorn }, meta, "chat", "classified", 1),
+		);
+		const auditLines = readFileSync(auditTorn, "utf8").split("\n");
+		check(
+			"an audit append onto a torn fragment reports nothing and lands the passthrough row on its own line",
+			auditRepair.errors.length === 0 &&
+				auditLines.length === 3 &&
+				auditLines[0] === fragment &&
+				JSON.parse(auditLines[1]).event === "passthrough" &&
+				auditLines[2] === "",
+			`${auditRepair.errors.join(" | ")} lines=${JSON.stringify(auditLines)}`,
+		);
+
+		const tornLedger = new Ledger(cfg, "sess", "turn-torn");
+		const tornTranscript = join(tornLedger.dir, "transcript.jsonl");
+		writeFileSync(tornTranscript, fragment);
+		const tornRecord = captureErrors(() => tornLedger.record({ role: "manager" }));
+		const tornRows = readFileSync(tornTranscript, "utf8").split("\n");
+		check(
+			"a transcript append onto a torn fragment keeps the fragment and starts the new row on its own line",
+			tornRecord.errors.length === 0 &&
+				tornRows.length === 3 &&
+				tornRows[0] === fragment &&
+				JSON.parse(tornRows[1]).role === "manager" &&
+				tornRows[2] === "",
+			`${tornRecord.errors.join(" | ")} rows=${JSON.stringify(tornRows)}`,
+		);
 	}
 
 	// --- audit through the input hook: a FIFO at the configured audit log does not hang the turn ---
