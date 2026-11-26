@@ -643,7 +643,7 @@ The per-turn dirs above are scratch. The durable record is a single append-only
 audit log at `auditLog` (default `<stateDir>/runs.jsonl`), one JSON row per run:
 
 ```
-{ "t", "event": "run", "source", "entry": "input"|"tool"|"command", "harness": "pi"|"claude",
+{ "t", "event": "run", "source", "entry": "input"|"tool"|"command"|"service", "harness": "pi"|"claude"|"dsh",
   "session", "provider", "model", "managerModel", "workerModel", "planSource", "classified",
   "converged", "stop", "stopDetail", "stopError", "iters", "maxIters", "callTimeoutMs",
   "calls", "tokens", "managerTokens", "workerTokens", "gate": { "command", "ran", "passed" },

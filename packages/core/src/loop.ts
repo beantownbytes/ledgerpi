@@ -95,7 +95,7 @@ export interface LoopResult {
  * (ideate, work, finalize, best-of-N candidates) and the manager bucket every other
  * spawn (plan, manage, review). Concurrent best-of-N candidates and an overlapping
  * gate are summed, so the total can exceed the run's wall-clock duration. `RoleTally`
- * in `packages/claude/src/rendezvous.ts` is the harness-side token counterpart.
+ * in `solve.ts` is the harness-side token counterpart.
  */
 export interface RoleTiming {
 	managerMs: number;
