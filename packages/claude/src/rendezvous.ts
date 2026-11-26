@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClaudeRoles } from "../../core/src/config.ts";
 import { report } from "../../core/src/report.ts";
+import type { RoleTally } from "../../core/src/solve.ts";
 import type { SpawnFailureDetail, SpawnFn, SpawnResult } from "../../core/src/spawn.ts";
 import type { LedgerEvent, StepReply, StepStatus } from "./protocol.ts";
 
@@ -13,13 +14,6 @@ const STOP_WAIT_MS = 5000;
 
 /** The plugin that namespaces the role agents. */
 const PLUGIN = "ledgerpi";
-
-/** What a run's steps cost and which models answered, for the audit row and the hand-off. */
-export interface RoleTally {
-	tokens: { manager: number; worker: number };
-	/** The model that last answered each role, or null when none did. */
-	models: { manager: string | null; worker: string | null };
-}
 
 /** The `SpawnFailureDetail` for each way a step can end without an answer. */
 const FAILURE_DETAIL: Record<Exclude<StepStatus, "answer">, SpawnFailureDetail> = {

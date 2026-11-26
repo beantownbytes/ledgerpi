@@ -45,6 +45,7 @@ test: typecheck ## Typecheck, then drive the extension hooks and ledgerctl again
 	node --experimental-strip-types test/hooks.test.ts
 	node --experimental-strip-types test/review-ledgers.test.ts
 	node --experimental-strip-types test/claude.test.ts
+	node --experimental-strip-types test/dsh.test.ts
 	node --experimental-strip-types test/fanout.test.ts
 	node --experimental-strip-types test/bench-worker-thinking.test.ts
 	node --experimental-strip-types test/concurrency-bench.test.ts

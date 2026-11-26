@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { isAlive } from "../../core/src/proc.ts";
+import { isAlive } from "./proc.ts";
 
 /** Who holds a repository's run lock. */
 export interface LockHolder {

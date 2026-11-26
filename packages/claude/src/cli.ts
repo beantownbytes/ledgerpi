@@ -2,26 +2,21 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { auditRun } from "../../core/src/audit.ts";
 import {
-	asFanoutSetting,
 	CLAUDE_MANAGER_DEFAULT,
 	CLAUDE_WORKER_DEFAULT,
-	type ClaudeRoles,
 	disabledByEnv,
 	type LedgerpiConfig,
 	loadConfig,
 } from "../../core/src/config.ts";
-import { readPlanFile, readRegularFile } from "../../core/src/files.ts";
+import { readRegularFile } from "../../core/src/files.ts";
 import { detectGate } from "../../core/src/gate.ts";
-import { headInfo, isGitRepo, workTreeRoot } from "../../core/src/git.ts";
-import { handoffBlock } from "../../core/src/handoff.ts";
-import { Ledger } from "../../core/src/ledger.ts";
-import { runLoop } from "../../core/src/loop.ts";
+import { workTreeRoot } from "../../core/src/git.ts";
+import { type LockHolder, lockHolder } from "../../core/src/lock.ts";
 import { report } from "../../core/src/report.ts";
-import { acquireLock, type LockHolder, lockHolder } from "./lock.ts";
+import { ABORTED_HANDOFF, type SolveArgs, type SolveOutcome, solveTask } from "../../core/src/solve.ts";
 import type { LedgerEvent } from "./protocol.ts";
-import { type RoleTally, rendezvous } from "./rendezvous.ts";
+import { rendezvous } from "./rendezvous.ts";
 
 /** Policy refused the run: expected behavior, not an error. */
 const EXIT_REFUSED = 3;
@@ -61,6 +56,30 @@ function shellQuote(path: string): string {
 	return `'${path.replaceAll("'", "'\\''")}'`;
 }
 
+/** The refusal for a work tree another loop holds. It does not invite the caller to edit beside that loop. */
+function refuseLocked(root: string): number {
+	const quoted = shellQuote(root);
+	return refuse(
+		`Another ledger loop is editing \`${root}\`. Wait for it to finish, \`ledgerctl status --json --cwd ${quoted}\` reports it under \`lock\`, or run \`ledgerctl stop --cwd ${quoted}\`, and leave this tree alone until then.`,
+	);
+}
+
+/** Print how a call ended, as the tool result the model reads, and return the exit code for it. */
+function deliver(outcome: SolveOutcome): number {
+	switch (outcome.kind) {
+		case "rejected":
+			return punt(outcome.message);
+		case "busy":
+			return refuseLocked(outcome.root);
+		case "canceled":
+			emitLine({ type: "done", handoff: ABORTED_HANDOFF });
+			return 0;
+		case "ran":
+			emitLine({ type: "done", handoff: outcome.handoff });
+			return 0;
+	}
+}
+
 /** The live loop holding the lock on the work tree containing `cwd`, or null when there is none. */
 function lockedTree(cfg: LedgerpiConfig, cwd: string): (LockHolder & { root: string }) | null {
 	const root = workTreeRoot(cwd);
@@ -85,107 +104,28 @@ function lockLine(lock: ReturnType<typeof lockReport>): string {
 	return `lock: held by pid ${lock.pid} (${lock.root})`;
 }
 
-/** A line for each role whose answers came from a model other than the configured one. */
-function modelMismatches(configured: ClaudeRoles, tally: RoleTally): string[] {
-	return (["manager", "worker"] as const).flatMap((role) => {
-		const ran = tally.models[role];
-		return ran === null || ran === configured[role]
-			? []
-			: [`The ${role} ran on ${ran}, not the configured ${configured[role]}.`];
-	});
-}
-
-interface SolveArgs {
-	cwd: string;
-	gate?: string;
-	planFile?: string;
-	fanout?: string;
-	session: string;
-	task: string;
-}
-
 async function solve(cfg: LedgerpiConfig, args: SolveArgs): Promise<number> {
 	for (const warning of cfg.warnings) report(warning);
 	const inactive = inactiveReason(cfg);
 	const claude = cfg.claude;
 	if (inactive !== null || claude === null) return punt(`ledgerpi is inactive: ${inactive}.`);
-	const task = args.task.trim();
-	if (!task) return punt("No task was provided.");
-	const root = isGitRepo(args.cwd) ? workTreeRoot(args.cwd) : null;
-	if (root === null) return punt(`\`${args.cwd}\` is not a git repository.`);
-	const planPath = args.planFile?.trim();
-	let plan: string | undefined;
-	if (planPath) {
-		const read = readPlanFile(planPath);
-		if ("error" in read) return punt(`${read.error}.`);
-		plan = read.plan;
-	}
-	const fanout = asFanoutSetting(args.fanout);
-	if (args.fanout !== undefined && fanout === undefined) {
-		report(`[ledgerpi] ignoring --fanout ${JSON.stringify(args.fanout)}: expected off, advise, ask or on`);
-	}
-	const release = acquireLock(cfg.stateDir, root);
-	if (release === null) {
-		const quoted = shellQuote(root);
-		return refuse(
-			`Another ledger loop is editing \`${root}\`. Wait for it to finish, \`ledgerctl status --json --cwd ${quoted}\` reports it under \`lock\`, or run \`ledgerctl stop --cwd ${quoted}\`, and leave this tree alone until then.`,
-		);
-	}
-
 	const controller = new AbortController();
 	for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
 		process.once(signal, () => controller.abort());
 	}
-	try {
-		const ledger = new Ledger(cfg, args.session, `${Date.now()}-${randomUUID().slice(0, 8)}`);
-		const { spawn, tally } = rendezvous(join(ledger.dir, "steps"), claude, emitLine);
-		const startedAt = Date.now();
-		const headStart = headInfo(args.cwd);
-		const looped = await runLoop({
-			spawn,
-			cfg,
-			ledger,
-			cwd: args.cwd,
-			task,
-			gateCommand: args.gate?.trim() || detectGate(cfg, args.cwd),
-			sessionModel: null,
+	return deliver(
+		await solveTask(cfg, args, {
+			harness: "claude",
+			entry: "tool",
+			provider: "anthropic",
 			managerModel: claude.manager,
 			workerModel: claude.worker,
-			plan,
-			fanout,
-			onProgress: (iter, label) => emitLine({ type: "progress", text: `ledger ${iter}/${cfg.maxIters}: ${label}` }),
+			sessionModel: null,
 			signal: controller.signal,
-		});
-		const result = {
-			...looped,
-			managerModel: tally.models.manager ?? looped.managerModel,
-			workerModel: tally.models.worker ?? looped.workerModel,
-		};
-		auditRun(
-			cfg,
-			{ entry: "tool", harness: "claude", session: args.session, provider: "anthropic", cwd: args.cwd },
-			result,
-			{
-				task,
-				durationMs: Date.now() - startedAt,
-				classified: null,
-				calls: result.calls,
-				tokens: result.tokens,
-				git: { start: headStart, end: headInfo(args.cwd) },
-				roleTokens: tally.tokens,
-			},
-		);
-		emitLine({
-			type: "done",
-			handoff:
-				result.stop === "aborted"
-					? "The ledger loop was aborted before completing."
-					: [handoffBlock(args.cwd, result), ...modelMismatches(claude, tally)].join("\n"),
-		});
-		return 0;
-	} finally {
-		release();
-	}
+			onProgress: (iter, label) => emitLine({ type: "progress", text: `ledger ${iter}/${cfg.maxIters}: ${label}` }),
+			spawner: (ledger) => rendezvous(join(ledger.dir, "steps"), claude, emitLine),
+		}),
+	);
 }
 
 /** The most recent Claude Code run in the audit log, or null. */

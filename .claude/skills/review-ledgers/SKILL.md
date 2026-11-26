@@ -54,12 +54,12 @@ ignored and fall through to the next tier.
 
 **Fail-closed caveat:** tiers 3 and 4 (the config's `auditLog` and `stateDir`) are
 honored only when the config loads *valid* -- it exists, parses, and either has a
-`[claude]` table, or defines at least one provider, has no retired `[blocklist]` table,
-and, if a `[allowlist]` table is present, that table is well-formed (the table is
-optional; an absent one is valid and empty). Those pi conditions do not govern a
-`[claude]` table: with one, a config with no providers, a retired `[blocklist]`, or a
-malformed `[allowlist]` leaves pi inert, but Claude Code runs and the file's paths are
-honored. If the config is not valid by these rules, ledgerpi is inert
+`[claude]` or `[dsh]` table, or defines at least one provider, has no retired
+`[blocklist]` table, and, if a `[allowlist]` table is present, that table is well-formed
+(the table is optional; an absent one is valid and empty). Those pi conditions do not
+govern a `[claude]` or `[dsh]` table: with one, a config with no providers, a retired
+`[blocklist]`, or a malformed `[allowlist]` leaves pi inert, but that table's harness
+runs and the file's paths are honored. If the config is not valid by these rules, ledgerpi is inert
 and its runtime resolver falls back to `LEDGERPI_AUDIT_LOG` if set, then
 `<LEDGERPI_STATE_DIR>/runs.jsonl` if `LEDGERPI_STATE_DIR` is set, then the default
 `<PI_CODING_AGENT_DIR|~/.pi/agent>/ledgerpi/runs.jsonl`. So do not trust an
@@ -85,7 +85,7 @@ ones the extension's `audit.ts` actually writes; re-derive against that source i
 changes.
 
 - **run** (one per completed loop, from any entry point): `{ t, event:"run", source,
-  harness:"pi"|"claude", entry:"input"|"tool"|"command", session, provider, model,
+  harness:"pi"|"claude"|"dsh", entry:"input"|"tool"|"command"|"service", session, provider, model,
   managerModel, workerModel, planSource, classified, converged, stop, stopDetail,
   stopError, iters,
   maxIters, callTimeoutMs, calls, tokens, managerTokens, workerTokens,

@@ -70,6 +70,18 @@ export type ClaudeRoles = { manager: string; worker: string };
 /** The `[claude]` roles, and whether each came from the config or the default. */
 export type ClaudeConfig = ClaudeRoles & { sources: Record<keyof ClaudeRoles, "config" | "default"> };
 
+/**
+ * The `[dsh]` settings per role. A null model is the dsh session model. A null
+ * reasoning effort is unset; a set one is kept as written, since effort ids differ
+ * between dsh model adapters.
+ */
+export type DshConfig = {
+	manager: string | null;
+	worker: string | null;
+	managerEffort: string | null;
+	workerEffort: string | null;
+};
+
 export interface LedgerpiConfig {
 	/** Master switch. False disables the extension entirely (it still loads, but every input passes through). */
 	enabled: boolean;
@@ -157,7 +169,13 @@ export interface LedgerpiConfig {
 	 * produce. It has no effect on pi.
 	 */
 	claude: ClaudeConfig | null;
-	/** Top-level `enabled = false` was set: the file switches the loop off on both harnesses. */
+	/**
+	 * The `[dsh]` section: the opt-in for running the loop under dsh. `null` means
+	 * inert under dsh, which an absent table, a table that is not one, and top-level
+	 * `enabled = false` all produce. It has no effect on pi or Claude Code.
+	 */
+	dsh: DshConfig | null;
+	/** Top-level `enabled = false` was set: the file switches the loop off on every harness. */
 	switchedOff: boolean;
 	/** Root for per-session ledger state. */
 	stateDir: string;
@@ -215,6 +233,7 @@ interface OperationalDefaults {
 	fanoutMax: number;
 	redirectSkills: string[];
 	claude: ClaudeConfig | null;
+	dsh: DshConfig | null;
 	switchedOff: boolean;
 	stateDir: string;
 	auditLog: string;
@@ -241,6 +260,7 @@ function operationalDefaults(): OperationalDefaults {
 		fanoutMax: FANOUT_MAX_DEFAULT,
 		redirectSkills: [],
 		claude: null,
+		dsh: null,
 		switchedOff: false,
 		stateDir: join(agentDir(), "ledgerpi"),
 		auditLog: join(agentDir(), "ledgerpi", "runs.jsonl"),
@@ -327,7 +347,8 @@ function parseAllowlist(value: unknown): Record<string, string[]> | null {
 	return out;
 }
 
-const MODEL_REF_RE = /^[^/\s]+\/\S+$/;
+/** A `"provider/modelId"` model reference. */
+export const MODEL_REF_RE = /^[^/\s]+\/\S+$/;
 
 /**
  * True for a plain object table: an object (not an array) whose prototype is
@@ -374,14 +395,18 @@ const malformedRoleEntryWarning = (ref: string) =>
 	`[ledgerpi] ignoring malformed [roleModel] entry "${ref}"; expected { manager = "provider/modelId", worker = "provider/modelId" } -- this session model stays inactive`;
 
 /**
- * Warn about sub-keys of a `[roleModel]` entry that name no role, naming the entry by
- * `label` (its `provider/modelId`, or `[roleModel] default`). Shared by the named-entry
- * and default paths so the message text is single-sourced; a stray sub-key is
- * reported but does not by itself drop the entry.
+ * Warn about sub-keys of a role table that are not in `allowed` (by default the two
+ * role names), naming the table by `where`. A stray sub-key is reported but does not
+ * by itself drop the table.
  */
-function warnUnknownRoleSubKeys(fields: Record<string, unknown>, where: string, warnings: string[]): void {
+function warnUnknownRoleSubKeys(
+	fields: Record<string, unknown>,
+	where: string,
+	warnings: string[],
+	allowed: readonly string[] = ["manager", "worker"],
+): void {
 	for (const sub of Object.keys(fields)) {
-		if (sub !== "manager" && sub !== "worker") {
+		if (!allowed.includes(sub)) {
 			warnings.push(`[ledgerpi] ignoring unknown sub-key "${sub}" in ${where}`);
 		}
 	}
@@ -566,6 +591,54 @@ function parseClaude(value: unknown, path: string, warnings: string[]): ClaudeCo
 	};
 }
 
+const DSH_KEYS = ["manager", "worker", "managerEffort", "workerEffort"] as const satisfies readonly (keyof DshConfig)[];
+
+/** One `[dsh]` role: the configured reference when valid, else null (the session model). */
+function dshRole(table: Record<string, unknown>, role: "manager" | "worker", warnings: string[]): string | null {
+	const value = table[role];
+	if (typeof value === "string" && MODEL_REF_RE.test(value)) return value;
+	if (value !== undefined) {
+		warnings.push(`[ledgerpi] [dsh] ${role} must be a "provider/modelId" reference; using the session model`);
+	}
+	return null;
+}
+
+/** One `[dsh]` reasoning effort: the configured string unchanged when non-empty, else null (unset). */
+function dshEffort(
+	table: Record<string, unknown>,
+	key: "managerEffort" | "workerEffort",
+	warnings: string[],
+): string | null {
+	const value = table[key];
+	if (typeof value === "string" && value !== "") return value;
+	if (value !== undefined) {
+		warnings.push(`[ledgerpi] [dsh] ${key} must be a non-empty string; treating it as unset`);
+	}
+	return null;
+}
+
+/**
+ * Parse the `[dsh]` table. Absent returns null, keeping dsh inert; a value that is
+ * not a table warns and does the same. Any table, an empty one included, is active:
+ * a bad value is dropped with a warning rather than disabling the loop, and never
+ * affects pi or Claude Code.
+ */
+function parseDsh(value: unknown, path: string, warnings: string[]): DshConfig | null {
+	if (value === undefined) return null;
+	if (!isPlainTable(value)) {
+		warnings.push(`[ledgerpi] ${path} has a malformed [dsh]; inert under dsh`);
+		return null;
+	}
+	const table = value as Record<string, unknown>;
+	warnUnknownRoleSubKeys(table, "[dsh]", warnings, DSH_KEYS);
+	return {
+		manager: dshRole(table, "manager", warnings),
+		worker: dshRole(table, "worker", warnings),
+		managerEffort: dshEffort(table, "managerEffort", warnings),
+		workerEffort: dshEffort(table, "workerEffort", warnings),
+	};
+}
+
 const KNOWN_KEYS = new Set([
 	"enabled",
 	"providers",
@@ -583,6 +656,7 @@ const KNOWN_KEYS = new Set([
 	"fanoutMax",
 	"redirectSkills",
 	"claude",
+	"dsh",
 	"stateDir",
 	"auditLog",
 	"callTimeoutMs",
@@ -594,13 +668,14 @@ const KNOWN_KEYS = new Set([
 /**
  * Reads the tracked TOML config over the operational defaults. Fail-closed: an
  * absent, non-regular (a directory or FIFO), or unreadable path, a malformed file,
- * or one that names no providers and has no `[claude]` table returns an INERT config
- * (disabled, no providers) rather than a built-in provider list, so a missing or broken config never
- * silently activates the loop. A malformed file is reported once and ignored,
+ * or one that names no providers and has no `[claude]` or `[dsh]` table returns an
+ * INERT config (disabled, no providers) rather than a built-in provider list, so a
+ * missing or broken config never silently activates the loop. A malformed file is reported once and ignored,
  * because failing to load config must never take the session down with it.
  * Unrecognized keys are skipped. Every problem is recorded in `warnings` rather
  * than printed, so loading writes nothing to the terminal. A file with a `[claude]`
- * table and no providers keeps pi inert while its operational knobs still apply.
+ * or `[dsh]` table and no providers keeps pi inert while its operational knobs
+ * still apply.
  */
 export function loadConfig(): LedgerpiConfig {
 	const ops = operationalDefaults();
@@ -627,7 +702,9 @@ export function loadConfig(): LedgerpiConfig {
 			? (raw.providers as string[])
 			: [];
 	const claude = parseClaude(raw.claude, path, warnings);
-	if (providers.length === 0 && claude === null) {
+	const dsh = parseDsh(raw.dsh, path, warnings);
+	const noHarnessTable = claude === null && dsh === null;
+	if (providers.length === 0 && noHarnessTable) {
 		warnings.push(`[ledgerpi] ${path} defines no providers; inert`);
 		return applyEnvOverrides(inertConfig(ops, warnings), false);
 	}
@@ -640,7 +717,7 @@ export function loadConfig(): LedgerpiConfig {
 		warnings.push(
 			`[ledgerpi] ${path} uses the retired [blocklist]; rename it to [allowlist] -- a listed provider now runs only the models listed, and a provider with no entry runs all of them. Inert until migrated.`,
 		);
-		if (claude === null) return applyEnvOverrides(inertConfig(ops, warnings), false);
+		if (noHarnessTable) return applyEnvOverrides(inertConfig(ops, warnings), false);
 	}
 
 	for (const key of Object.keys(raw)) {
@@ -652,14 +729,14 @@ export function loadConfig(): LedgerpiConfig {
 	const allowlist = parseAllowlist(raw.allowlist);
 	if (allowlist === null) {
 		warnings.push(`[ledgerpi] ${path} has a malformed [allowlist]; inert`);
-		if (claude === null) return applyEnvOverrides(inertConfig(ops, warnings), false);
+		if (noHarnessTable) return applyEnvOverrides(inertConfig(ops, warnings), false);
 	}
 
 	// A valid file with providers is the single source of truth for activation:
 	// enabled/providers/allowlist come from the file only (enabled defaults true),
 	// and the operational knobs take field-level overrides over the defaults. A
 	// provider-less file, or one whose pi policy failed closed, reaches here only for
-	// its [claude] table, which those policies do not govern, so pi stays inert.
+	// its [claude] or [dsh] table, which those policies do not govern, so pi stays inert.
 	const piProviders = retiredPolicy || allowlist === null ? [] : providers;
 	const cfg: LedgerpiConfig = {
 		...ops,
@@ -671,6 +748,7 @@ export function loadConfig(): LedgerpiConfig {
 	cfg.switchedOff = raw.enabled === false;
 	if (cfg.switchedOff) cfg.enabled = false;
 	cfg.claude = cfg.switchedOff ? null : claude;
+	cfg.dsh = cfg.switchedOff ? null : dsh;
 	if (typeof raw.gate === "string" || raw.gate === null) cfg.gate = raw.gate as string | null;
 	if (typeof raw.maxIters === "number" && raw.maxIters > 0) cfg.maxIters = Math.floor(raw.maxIters);
 	cfg.workerThinking = coerceThinking(raw.workerThinking, cfg.workerThinking);

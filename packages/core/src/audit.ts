@@ -24,11 +24,12 @@ import type { SpawnFailureDetail } from "./spawn.ts";
 export interface AuditMeta {
 	/**
 	 * "input" (the submitted-prompt hook), "tool" (the ledger_solve call), "command"
-	 * (the /ledger command), or "redirect" (a decline at the skill-session edit redirect).
+	 * (the /ledger command), "redirect" (a decline at the skill-session edit redirect),
+	 * or "service" (another dsh plugin calling the ledgerpi service).
 	 */
-	entry: "input" | "tool" | "command" | "redirect";
+	entry: "input" | "tool" | "command" | "redirect" | "service";
 	/** The harness the row came from; "pi" when unset. */
-	harness?: "pi" | "claude";
+	harness?: "pi" | "claude" | "dsh";
 	session: string;
 	provider?: string;
 	model?: string;

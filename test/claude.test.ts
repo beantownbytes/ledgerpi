@@ -13,7 +13,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Dispatcher, type Engine, type StepTurn } from "../packages/claude/src/dispatch.ts";
-import { acquireLock, lockDir, lockHolder } from "../packages/claude/src/lock.ts";
 import type { LedgerEvent, StepEvent, StepReply } from "../packages/claude/src/protocol.ts";
 import { rendezvous } from "../packages/claude/src/rendezvous.ts";
 import {
@@ -22,6 +21,7 @@ import {
 	type LedgerpiConfig,
 	loadConfig,
 } from "../packages/core/src/config.ts";
+import { acquireLock, lockDir, lockHolder } from "../packages/core/src/lock.ts";
 import { deadPid, TIMING_KEYS } from "./helpers.ts";
 
 const root = join(tmpdir(), `ledgerpi-claude-test-${process.pid}`);
@@ -636,7 +636,7 @@ async function testStaleLock(): Promise<void> {
  * reported, so a late starter cannot win a lock an earlier winner has given back.
  */
 async function raceForLock(count: number): Promise<number> {
-	const lockModule = resolve(import.meta.dirname, "../packages/claude/src/lock.ts");
+	const lockModule = resolve(import.meta.dirname, "../packages/core/src/lock.ts");
 	const script = `
 		import { acquireLock } from ${JSON.stringify(lockModule)};
 		console.log("ready");
