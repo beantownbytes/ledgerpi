@@ -56,7 +56,8 @@ ignored and fall through to the next tier.
 honored only when the config loads *valid* -- it exists, parses, and either has a
 `[claude]` or `[dsh]` table, or defines at least one provider, has no retired
 `[blocklist]` table, and, if a `[allowlist]` table is present, that table is well-formed
-(the table is optional; an absent one is valid and empty). Those pi conditions do not
+(the table is optional; an absent one is valid and empty). A `[claude]` or `[dsh]` table,
+even an empty one, opts that harness in. Those pi conditions do not
 govern a `[claude]` or `[dsh]` table: with one, a config with no providers, a retired
 `[blocklist]`, or a malformed `[allowlist]` leaves pi inert, but that table's harness
 runs and the file's paths are honored. If the config is not valid by these rules, ledgerpi is inert
@@ -105,8 +106,10 @@ changes.
   row from a version predating the fields, which is missing, not zero, and aggregates
   as untimed. `harness` is absent on older rows, which aggregate as `unknown`. Claude rows
   have `provider:"anthropic"`, `model:null` (the loop runs outside the session model),
-  the model each role was observed answering on, and `managerTokens`/`workerTokens`,
-  which are `null` on pi. Claude's `tokens` count cache reads and writes. `repoUrl` (origin, http(s) userinfo stripped), `branch`, and the
+  and the model each role was observed answering on. Claude and dsh rows both write
+  `managerTokens`/`workerTokens`; they are `null` on pi, reported as `n/a`. Check each
+  harness's cache-read accounting before stating what its token counts include.
+  `repoUrl` (origin, http(s) userinfo stripped), `branch`, and the
   `headStart`/`headEnd` SHAs are `null` when git cannot say and absent on older rows.
   `stop` is one of `done|budget|no-progress|spawn-failure|unconverged|aborted`.
   `stopDetail` is only meaningful on `stop:"spawn-failure"` rows, where it names the
@@ -317,10 +320,12 @@ pooled with a same-model run of the same session model.
     group_by([src,.provider,.model])[]|[(.[0]|src),"\(.[0].provider)/\(.[0].model)","runs=\(map(select(.event=="run"))|length)","passthrough=\(map(select(.event=="passthrough"))|length)"]|@tsv'
   ```
 
-- Harness split (`harness` absent on older rows reads as `unknown`; role tokens are
-  Claude-only, so pi reports `n/a`). Never pool the harnesses in a cost comparison:
-  Claude's `tokens` include cache reads. The views above do not split by harness, so when
-  the log holds both, narrow it to one harness first, then rerun them on the narrowed file:
+- Harness split (`harness` absent on older rows reads as `unknown`; claude and dsh rows
+  write `managerTokens`/`workerTokens`, and pi reports `n/a`). Never pool the harnesses in
+  a cost comparison: check each harness's cache-read accounting before stating what its
+  `tokens` include. The views above do not split by harness, so when the log holds more
+  than one, narrow it to one harness first (`"claude"` here), then rerun them on the
+  narrowed file:
   `NARROWED=$(mktemp) && jq -R -c 'fromjson? | select(type=="object" and .harness=="claude")' "$LOG" > "$NARROWED" && LOG=$NARROWED`.
   ```bash
   jq -R 'fromjson? | select(type=="object")' "$LOG" | jq -s -r '

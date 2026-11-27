@@ -8,6 +8,7 @@ import {
 	realpathSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -597,12 +598,35 @@ async function testRefusalStopsFromAnotherTree(): Promise<void> {
 }
 
 /** Plant a claim on work tree `claimRoot` for `pid`, returning its path. */
-function plantClaim(claimRoot: string, pid: number): string {
+function plantClaim(claimRoot: string, pid: number, suffix = "planted"): string {
 	const dir = lockDir(stateDir, claimRoot);
 	mkdirSync(dir, { recursive: true });
-	const path = join(dir, `${pid}.planted`);
+	const path = join(dir, `${pid}.${suffix}`);
 	writeFileSync(path, "");
 	return path;
+}
+
+async function testSharedHostLock(): Promise<void> {
+	resetRepo();
+	const host = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+	const claim = plantClaim(realpathSync(repo), host.pid as number, "planted.shared");
+	try {
+		const stopped = ctl(["stop", `--cwd=${repo}`]);
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		check(
+			"stop leaves a shared host process running and says why",
+			stopped.code === 1 && host.signalCode === null && stopped.stdout.includes("not signaled"),
+			{ stopped, signal: host.signalCode },
+		);
+		const busy = await solve("Task.", () => {});
+		check("a shared holder is still busy", busy.code === 3, busy);
+		check("its refusal does not suggest stop", !handoff(busy).includes("ledgerctl stop"), handoff(busy));
+		const state = JSON.parse(ctl(["status", "--json", `--cwd=${repo}`]).stdout);
+		check("status reports the holder as shared", state.lock?.shared === true, state.lock);
+	} finally {
+		host.kill();
+		rmSync(claim, { force: true });
+	}
 }
 
 async function testStaleLock(): Promise<void> {
@@ -628,6 +652,20 @@ async function testStaleLock(): Promise<void> {
 	rmSync(live);
 	rmSync(deadClaim, { force: true });
 	check("the lock is free once the claims go", lockHolder(stateDir, treeRoot) === null);
+
+	const recycled = plantClaim(treeRoot, process.pid, "planted.shared");
+	check("a claim an earlier process with this pid left reads as free", lockHolder(stateDir, treeRoot) === null);
+	const retaken = acquireLock(stateDir, treeRoot);
+	check("and is taken over and removed", retaken !== null && !existsSync(recycled), recycled);
+	check("this process's own claim still holds", lockHolder(stateDir, treeRoot)?.pid === process.pid);
+	check("and still excludes a second one", acquireLock(stateDir, treeRoot) === null);
+	const alias = join(root, "state-alias");
+	symlinkSync(stateDir, alias);
+	check("another spelling of the state directory sees the held lock", lockHolder(alias, treeRoot) !== null);
+	check("and cannot take it", acquireLock(alias, treeRoot) === null);
+	check("which leaves the claim in place", lockHolder(stateDir, treeRoot)?.pid === process.pid);
+	rmSync(alias);
+	retaken?.();
 }
 
 /**
@@ -1400,6 +1438,7 @@ async function run(): Promise<void> {
 	await testPlanFile();
 	await testSolveFanout();
 	await testRefusalStopsFromAnotherTree();
+	await testSharedHostLock();
 	await testStaleLock();
 	await testConcurrentLock();
 	testLockReleaseIsOwned();
