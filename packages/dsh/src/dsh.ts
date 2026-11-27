@@ -116,12 +116,87 @@ export interface DshLlm {
 	): Promise<unknown>;
 }
 
+/** The policy of one execution. The shell takes it whole, as the policy service resolved it. */
+export interface DshExecutionPolicy {
+	/** `read-only`, `workspace-write`, `danger-full-access`, or a mode added later. */
+	readonly mode: string;
+	readonly workspaceRoot: string;
+	readonly additionalWritableRoots?: readonly string[];
+	readonly sessionId?: string;
+}
+
 export interface DshSandboxPolicy {
-	resolve(request: { session: DshSession }): {
+	resolve(request: { session: DshSession }): DshExecutionPolicy;
+}
+
+/** At `timeoutMs`, `kill` stops the command and `none` arms no deadline. */
+export type DshShellExpiry = "kill" | "none";
+
+/** The part of a shell execution request used here. */
+export interface DshShellRequest {
+	command: string;
+	workdir?: string;
+	/** Capped by the shell. */
+	timeoutMs?: number;
+	/** `kill` when absent. */
+	onExpiry?: DshShellExpiry;
+	/** Kills the command when it fires, or at once when already aborted. */
+	signal?: AbortSignal;
+	sandboxPolicy?: DshExecutionPolicy;
+}
+
+/** A request with the shell's defaults and caps applied. */
+export interface DshShellSpec extends DshShellRequest {
+	workdir: string;
+	timeoutMs: number;
+	onExpiry: DshShellExpiry;
+}
+
+export interface DshShellOutput {
+	/** The tail of the stream when `truncated`. */
+	readonly text: string;
+	readonly truncated: boolean;
+	readonly spillPath?: string;
+}
+
+export interface DshShellResult {
+	/** Null when the command was killed by a signal or never started. */
+	readonly exitCode: number | null;
+	readonly signal: NodeJS.Signals | null;
+	/** The shell's own deadline cut the command short; never set together with `aborted`. */
+	readonly timedOut: boolean;
+	/** The request's signal killed the command. */
+	readonly aborted: boolean;
+	readonly timeoutMs: number;
+	readonly stdout: DshShellOutput;
+	readonly stderr: DshShellOutput;
+	/** Absent from a shell that does not sandbox. */
+	readonly sandbox?: {
 		readonly mode: string;
-		readonly workspaceRoot: string;
-		readonly additionalWritableRoots?: readonly string[];
+		/** The sandbox denied a file operation. */
+		readonly denied: boolean;
+		readonly enforcement?: "full" | "partial";
+		readonly runnerFailed?: boolean;
 	};
+}
+
+/** The part of a running command used here. */
+export interface DshShellExecution {
+	/** Terminates the command; false when it had already finished. */
+	kill(): boolean;
+	/**
+	 * Settles when the process closes. Rejects only when the command could not be run,
+	 * with code `SANDBOX_UNAVAILABLE` when the sandbox runner could not confine it.
+	 */
+	result(): Promise<DshShellResult>;
+}
+
+export interface DshShell {
+	/** The mode this shell sandboxes with by default, or undefined when it does not sandbox. */
+	readonly sandboxMode: string | undefined;
+	resolve(request: DshShellRequest): DshShellSpec;
+	/** Rejects when preparation fails or the signal aborts before the command starts. */
+	execute(spec: DshShellSpec): Promise<DshShellExecution>;
 }
 
 export interface DshWorkingDirectory {
@@ -143,6 +218,7 @@ export interface DshServices {
 	llm: DshLlm;
 	workingDirectory: DshWorkingDirectory;
 	sandboxPolicy: DshSandboxPolicy;
+	shell: DshShell;
 	agents: DshAgents;
 	agentPresets: DshAgentPresets;
 }

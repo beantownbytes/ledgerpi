@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs, { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
+import { mock } from "node:test";
+import { setTimeout as sleep, setImmediate as turn } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { type DshConfig, type LedgerpiConfig, loadConfig } from "../packages/core/src/config.ts";
@@ -37,12 +38,17 @@ import { agentBodies, personaBody, renderPatch } from "../packages/dsh/build-pat
 import {
 	type DshAgent,
 	type DshCreatedAgent,
+	type DshExecutionPolicy,
 	type DshLlm,
 	type DshPluginContext,
 	type DshRole,
 	type DshSandboxPolicy,
 	type DshServices,
 	type DshSessionEvent,
+	type DshShell,
+	type DshShellExecution,
+	type DshShellResult,
+	type DshShellSpec,
 	type DshSpawnSpec,
 	type DshSubagentActivation,
 	type DshSubagentResult,
@@ -54,6 +60,7 @@ import {
 	LEDGER_PRESETS,
 	parentRoute,
 } from "../packages/dsh/src/dsh.ts";
+import { dshGateRunner, gateCheck } from "../packages/dsh/src/gate.ts";
 import plugin, { restrictLedgerChildren } from "../packages/dsh/src/service.ts";
 import { createDshSpawner, type DshRolesOptions, dshRoles } from "../packages/dsh/src/spawn.ts";
 import toolPlugin from "../packages/dsh/src/tool.ts";
@@ -1138,6 +1145,112 @@ const sandbox = (mode: string, workspaceRoot = project, additionalWritableRoots?
 	resolve: () => ({ mode, workspaceRoot, additionalWritableRoots }),
 });
 
+const collected = (text: string) => ({ text, truncated: false });
+
+const shellResult = (result: Partial<DshShellResult> = {}): DshShellResult => ({
+	exitCode: 0,
+	signal: null,
+	timedOut: false,
+	aborted: false,
+	timeoutMs: 120_000,
+	stdout: collected(""),
+	stderr: collected(""),
+	...result,
+});
+
+/** A command that has already ended with `result`. */
+const settled = (result: Partial<DshShellResult> = {}): DshShellExecution => ({
+	kill: () => false,
+	result: async () => shellResult(result),
+});
+
+/** A command that could not be run. */
+const unrunnable = (error: Error): DshShellExecution => ({ kill: () => false, result: () => Promise.reject(error) });
+
+/**
+ * `spec.command` run by `/bin/sh` in `spec.workdir`, whose process group is killed
+ * by `kill`, by the signal, and at the deadline under `onExpiry: "kill"`.
+ */
+function shExecution(spec: DshShellSpec): DshShellExecution {
+	const child = spawn("/bin/sh", ["-c", spec.command], {
+		cwd: spec.workdir,
+		detached: true,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const output = { stdout: "", stderr: "" };
+	for (const name of ["stdout", "stderr"] as const) {
+		child[name].on("data", (data) => {
+			output[name] += data;
+		});
+	}
+	let running = true;
+	let cause: "timedOut" | "aborted" | undefined;
+	const kill = () => {
+		if (!running || child.pid === undefined) return false;
+		try {
+			process.kill(-child.pid, "SIGKILL");
+		} catch {}
+		return true;
+	};
+	const stop = (why: "timedOut" | "aborted") => {
+		cause ??= why;
+		kill();
+	};
+	const timer = spec.onExpiry === "kill" ? setTimeout(() => stop("timedOut"), spec.timeoutMs) : undefined;
+	const onAbort = () => stop("aborted");
+	spec.signal?.addEventListener("abort", onAbort, { once: true });
+	if (spec.signal?.aborted) onAbort();
+	const done = new Promise<DshShellResult>((resolve, reject) => {
+		const end = () => {
+			running = false;
+			clearTimeout(timer);
+			spec.signal?.removeEventListener("abort", onAbort);
+		};
+		child.on("error", (err) => {
+			end();
+			reject(err);
+		});
+		child.on("close", (exitCode, signal) => {
+			end();
+			resolve(
+				shellResult({
+					exitCode,
+					signal,
+					timedOut: cause === "timedOut",
+					aborted: cause === "aborted",
+					timeoutMs: spec.timeoutMs,
+					stdout: collected(output.stdout),
+					stderr: collected(output.stderr),
+				}),
+			);
+		});
+	});
+	done.catch(() => {});
+	return { kill, result: () => done };
+}
+
+/** A shell like dsh's that records the specs it executes and caps timeouts as dsh's does. */
+function fakeShell({
+	confines = true,
+	execute = async (spec: DshShellSpec): Promise<DshShellExecution> => shExecution(spec),
+} = {}) {
+	const specs: DshShellSpec[] = [];
+	const shell: DshShell = {
+		sandboxMode: confines ? "read-only" : undefined,
+		resolve: (request) => ({
+			...request,
+			workdir: request.workdir ?? process.cwd(),
+			timeoutMs: Math.min(request.timeoutMs ?? 120_000, 600_000),
+			onExpiry: request.onExpiry ?? "kill",
+		}),
+		execute: (spec) => {
+			specs.push(spec);
+			return execute(spec);
+		},
+	};
+	return Object.assign(shell, { specs });
+}
+
 type CreatedListener = (payload: { readonly agent: DshCreatedAgent }) => void;
 type Guard = Parameters<DshTools["guard"]>[0];
 
@@ -1361,6 +1474,7 @@ function dshHost(
 		agents: { get: (id) => live.get(id) },
 		agentPresets: { resolve: async () => ({}) },
 		sandboxPolicy: sandbox("workspace-write"),
+		shell: fakeShell(),
 		...services,
 	};
 	const specs: DshSpawnSpec[] = [];
@@ -1737,6 +1851,675 @@ async function testServiceModels(): Promise<void> {
 	);
 }
 
+/** A policy service that resolves to each of `steps` in turn, then to the last again; an Error is thrown. */
+function changingPolicy(...steps: (string | Error)[]): DshSandboxPolicy {
+	let calls = 0;
+	return {
+		resolve: () => {
+			const step = steps[Math.min(calls++, steps.length - 1)];
+			if (step instanceof Error) throw step;
+			return { mode: step, workspaceRoot: project };
+		},
+	};
+}
+
+/** Check that a call is refused as `expected` while the lock is held, so before it is taken. */
+async function checkRefusedBeforeLock(
+	label: string,
+	expected: string,
+	host: ReturnType<typeof dshHost>,
+	call?: () => Promise<DshSolveOutcome>,
+): Promise<DshSolveOutcome> {
+	const release = acquireLock(join(root, "state"), project);
+	try {
+		return await checkRefused(label, expected, host, call);
+	} finally {
+		release?.();
+	}
+}
+
+/** A gate command that cannot be mistaken for the probe's `true`. */
+const GATE = "test -d .";
+
+const probes = (shell: ReturnType<typeof fakeShell>) => shell.specs.filter((spec) => spec.command === "true");
+
+async function testServiceGateShell(): Promise<void> {
+	const shellless = dshHost({ shell: undefined });
+	await checkRefusedBeforeLock("A1 no shell service", "rejected gate-unavailable", shellless);
+	await checkRefusedBeforeLock("A1 a configured gate is checked too", "rejected gate-unavailable", shellless, () =>
+		shellless.solve({ gate: undefined }, 'gate = "true"\n[dsh]\n'),
+	);
+	for (const gate of [undefined, "  "]) {
+		const outcome = await shellless.solve({ gate });
+		check(
+			`A0 with no shell, a run with gate ${JSON.stringify(gate)} still runs`,
+			outcome.kind === "ran" && outcome.result.gate === null,
+			outcome,
+		);
+	}
+	await checkRefusedBeforeLock(
+		"A1 comes before the policy is looked at",
+		"rejected gate-unavailable",
+		dshHost({ shell: undefined, sandboxPolicy: changingPolicy("workspace-write", new Error("offline")) }),
+	);
+	await checkRefusedBeforeLock(
+		"A1 comes before full access passes",
+		"rejected gate-unavailable",
+		dshHost({ shell: undefined, sandboxPolicy: sandbox("danger-full-access") }),
+	);
+	for (const confines of [true, false]) {
+		const shell = fakeShell({ confines });
+		const outcome = await dshHost({ shell, sandboxPolicy: sandbox("danger-full-access") }).solve({ gate: GATE });
+		check(
+			`A3 full access runs without a probe on a shell that ${confines ? "confines" : "does not confine"}`,
+			outcome.kind === "ran" && outcome.result.converged && probes(shell).length === 0,
+			{ outcome, specs: shell.specs },
+		);
+	}
+
+	for (const mode of ["workspace-write", "read-only"]) {
+		const shell = fakeShell({ confines: false });
+		const host = dshHost({ shell, sandboxPolicy: changingPolicy("workspace-write", mode) });
+		const outcome = await checkRefusedBeforeLock(
+			`A4 ${mode} on a shell that does not confine`,
+			"rejected gate-unconfined",
+			host,
+		);
+		check(
+			`A4 ${mode} is named and nothing is executed`,
+			messageOf(outcome).includes(mode) && shell.specs.length === 0,
+			{ outcome, specs: shell.specs },
+		);
+	}
+}
+
+async function testServiceGatePolicy(): Promise<void> {
+	const absentShell = fakeShell();
+	const absent = dshHost({ shell: absentShell });
+	const get = absent.ctx.get;
+	let asked = 0;
+	absent.ctx.get = ((name) =>
+		name === "sandboxPolicy" && ++asked > 1 ? undefined : get(name)) as DshPluginContext["get"];
+	await checkRefusedBeforeLock("A2 no policy service at the gate check", "rejected sandbox-unavailable", absent);
+
+	const failingShell = fakeShell();
+	const failing = await checkRefusedBeforeLock(
+		"A2 a policy that cannot be resolved at the gate check",
+		"rejected sandbox-unavailable",
+		dshHost({
+			shell: failingShell,
+			sandboxPolicy: changingPolicy("workspace-write", new Error("policy store offline")),
+		}),
+	);
+	check("A2 the message carries the cause", messageOf(failing).includes("policy store offline"), failing);
+
+	const unknownShell = fakeShell();
+	const unknown = await checkRefusedBeforeLock(
+		"A6 an unknown mode at the gate check",
+		"rejected sandbox-unavailable",
+		dshHost({ shell: unknownShell, sandboxPolicy: changingPolicy("workspace-write", "something-new") }),
+	);
+	check("A6 the mode is named", messageOf(unknown).includes("something-new"), unknown);
+	check(
+		"A2 and A6 execute nothing",
+		[absentShell, failingShell, unknownShell].every((shell) => shell.specs.length === 0),
+	);
+}
+
+async function testServiceGateProbe(): Promise<void> {
+	const policy: DshExecutionPolicy = {
+		mode: "workspace-write",
+		workspaceRoot: project,
+		additionalWritableRoots: [beside],
+		sessionId: "parent-session",
+	};
+	const { signal } = new AbortController();
+	let freeDuringProbe = false;
+	const shell = fakeShell({
+		execute: async (spec) => {
+			if (spec.command === "true") freeDuringProbe = lockFree(project);
+			return shExecution(spec);
+		},
+	});
+	const passed = await dshHost({ shell, sandboxPolicy: { resolve: () => policy } }).solve({
+		cwd: "sub",
+		gate: GATE,
+		signal,
+	});
+	const [probe] = probes(shell);
+	check(
+		"A5b a probe that exits 0 lets the run go on",
+		passed.kind === "ran" && passed.result.converged && probes(shell).length === 1,
+		{ passed, specs: shell.specs },
+	);
+	check(
+		"A5 the probe runs in the run path under the whole policy, with the call's signal and a 10 s deadline",
+		probe?.workdir === join(project, "sub") &&
+			probe.sandboxPolicy === policy &&
+			probe.signal === signal &&
+			probe.timeoutMs === 10_000 &&
+			probe.onExpiry === "kill",
+		probe,
+	);
+	check("A5 the probe runs before the lock is taken", freeDuringProbe);
+
+	const readOnly = fakeShell();
+	await dshHost({ shell: readOnly, sandboxPolicy: changingPolicy("workspace-write", "read-only") }).solve({
+		gate: GATE,
+	});
+	check("A5 a read-only mode is probed", probes(readOnly)[0]?.sandboxPolicy?.mode === "read-only", readOnly.specs);
+
+	const unusable = rejection("no sandbox backend is usable", "SANDBOX_UNAVAILABLE");
+	for (const [label, execute, cause] of [
+		["a runner that cannot confine", async () => unrunnable(unusable), "no sandbox backend is usable"],
+		["a command that cannot start", () => Promise.reject(new Error("spawn failed")), "spawn failed"],
+		[
+			"a nonzero exit",
+			async () => settled({ exitCode: 3, stderr: collected("cannot mount\n") }),
+			"exit code 3: cannot mount",
+		],
+		["a death by signal", async () => settled({ exitCode: null, signal: "SIGKILL" }), "signal SIGKILL"],
+		[
+			"a timeout",
+			async () => settled({ exitCode: null, timedOut: true, timeoutMs: 10_000 }),
+			"timed out after 10000 ms",
+		],
+	] as const) {
+		const outcome = await checkRefusedBeforeLock(
+			`A5c ${label}`,
+			"rejected sandbox-unavailable",
+			dshHost({ shell: fakeShell({ execute }) }),
+		);
+		check(`A5c ${label} is reported`, messageOf(outcome).includes(cause), outcome);
+	}
+	const unresolvable = fakeShell();
+	unresolvable.resolve = () => {
+		throw new Error("bad shell config");
+	};
+	const refused = await checkRefusedBeforeLock(
+		"A5c a request the shell cannot resolve",
+		"rejected sandbox-unavailable",
+		dshHost({ shell: unresolvable }),
+	);
+	check("A5c the resolve error is reported", messageOf(refused).includes("bad shell config"), refused);
+
+	for (const [label, end] of [
+		["ends as aborted", async () => settled({ exitCode: null, aborted: true })],
+		["passes", async () => settled()],
+		["throws", () => Promise.reject(new Error("aborted"))],
+	] as const) {
+		const controller = new AbortController();
+		const host = dshHost({
+			shell: fakeShell({
+				execute: () => {
+					controller.abort();
+					return end();
+				},
+			}),
+		});
+		await checkRefusedBeforeLock(`A5a an abort during a probe that ${label} cancels`, "canceled", host, () =>
+			host.solve({ signal: controller.signal }),
+		);
+	}
+}
+
+/** The gate runner of a fake dsh host whose services are `services`. */
+function gateRunner(services: Partial<DshServices> = {}) {
+	const host = dshHost(services);
+	return dshGateRunner(host.ctx, host.parent);
+}
+
+/** A command that ends only when `end` is called, counting the calls to `kill`. */
+function held() {
+	let end: (result?: Partial<DshShellResult>) => void = () => {};
+	const done = new Promise<DshShellResult>((resolve) => {
+		end = (result) => resolve(shellResult(result));
+	});
+	const seen = { kills: 0 };
+	const execution: DshShellExecution = {
+		kill: () => {
+			seen.kills++;
+			return true;
+		},
+		result: () => done,
+	};
+	return { execution, seen, end };
+}
+
+/** Whether `verdict` says the gate never ran, with `cause` in its output. */
+const notRun = (verdict: GateVerdict | null | undefined, cause: string): boolean =>
+	verdict?.ran === false && verdict.passed === false && verdict.output?.includes(cause) === true;
+
+/** Whether `verdict` is that of a gate that outlived its timeout. */
+const outOfTime = (verdict: GateVerdict | undefined): boolean =>
+	verdict?.ran === true && verdict.passed === false && verdict.output?.endsWith("\n[gate timed out]") === true;
+
+async function testGateRunnerRefusals(): Promise<void> {
+	const shell = fakeShell();
+	const aborted = await gateRunner({ shell })(GATE, project, 1_000, AbortSignal.abort());
+	check("B1 an aborted gate does not run", notRun(aborted, "aborted") && aborted.command === GATE, aborted);
+	const shellless = await gateRunner({ shell: undefined })(GATE, project, 1_000);
+	check("B2 no shell service", notRun(shellless, "No shell service"), shellless);
+	for (const [label, sandboxPolicy, cause] of [
+		["B3 no policy service", undefined, "No sandbox policy service"],
+		["B3 a policy that cannot be resolved", changingPolicy(new Error("policy store offline")), "store offline"],
+		["B3 a policy service that returns nothing", { resolve: () => undefined as never }, "mode"],
+		["B4 an unknown mode", sandbox("something-new"), "something-new"],
+	] as const) {
+		const verdict = await gateRunner({ shell, sandboxPolicy })(GATE, project, 1_000);
+		check(label, notRun(verdict, cause), verdict);
+	}
+	for (const mode of ["workspace-write", "read-only"]) {
+		const unconfining = fakeShell({ confines: false });
+		const verdict = await gateRunner({ shell: unconfining, sandboxPolicy: sandbox(mode) })(GATE, project, 1_000);
+		check(
+			`B5 ${mode} on a shell that does not confine never runs`,
+			notRun(verdict, "does not sandbox") && unconfining.specs.length === 0,
+			{ verdict, specs: unconfining.specs },
+		);
+	}
+	check("B1 to B4 execute nothing", shell.specs.length === 0, shell.specs);
+}
+
+async function testGateRunnerResults(): Promise<void> {
+	const policy: DshExecutionPolicy = { mode: "workspace-write", workspaceRoot: project, sessionId: "parent-session" };
+	const shell = fakeShell();
+	const passed = await gateRunner({ shell, sandboxPolicy: { resolve: () => policy } })(
+		"pwd -P",
+		join(project, "sub"),
+		700_000,
+	);
+	const [spec] = shell.specs;
+	check("B6e exit 0 passes", isDeepStrictEqual(passed, { ran: true, passed: true, command: "pwd -P" }), passed);
+	check(
+		"B6 the shell gets the whole policy, the cwd, the command and no deadline of its own",
+		spec?.command === "pwd -P" &&
+			spec.workdir === join(project, "sub") &&
+			spec.sandboxPolicy === policy &&
+			spec.onExpiry === "none" &&
+			spec.signal?.aborted === false,
+		spec,
+	);
+	for (const confines of [true, false]) {
+		const verdict = await gateRunner({
+			shell: fakeShell({ confines }),
+			sandboxPolicy: sandbox("danger-full-access"),
+		})(GATE, project, 1_000);
+		check(`B6 full access runs on a shell that ${confines ? "confines" : "does not confine"}`, verdict.passed);
+	}
+
+	const run = gateRunner();
+	const failed = await run("printf out; echo err >&2; exit 3", project, 10_000);
+	check(
+		"B6f a failed gate carries both streams",
+		failed.ran && !failed.passed && failed.output === "out\nerr\n",
+		failed,
+	);
+	const long = await run("printf 'x%.0s' $(seq 4000); echo end >&2; exit 1", project, 10_000);
+	check("B6f the output is cut to its tail", long.output?.length === 3_000 && long.output.endsWith("x\nend\n"), long);
+	const killed = await run("kill -9 $$", project, 10_000);
+	check("B6f a death by signal fails the gate", killed.ran && !killed.passed, killed);
+
+	const confinement = { mode: "workspace-write", enforcement: "partial" as const };
+	for (const denied of [true, false]) {
+		const execute = async () =>
+			settled({ exitCode: 1, stderr: collected("touch: denied\n"), sandbox: { ...confinement, denied } });
+		const verdict = await gateRunner({ shell: fakeShell({ execute }) })(GATE, project, 1_000);
+		check(
+			`B6f a failure ${denied ? "with" : "without"} a denial ${denied ? "says so" : "says nothing of one"}`,
+			verdict.output === `touch: denied\n${denied ? "\n[sandbox denied a write]" : ""}`,
+			verdict,
+		);
+	}
+
+	const unusable = rejection("no sandbox backend is usable", "SANDBOX_UNAVAILABLE");
+	for (const [label, execute, cause] of [
+		["B6a an execute that rejects", () => Promise.reject(new Error("spawn failed")), "spawn failed"],
+		["B6c a runner that cannot confine", async () => unrunnable(unusable), "no sandbox backend is usable"],
+		["B6d an aborted result", async () => settled({ exitCode: null, aborted: true }), "aborted"],
+	] as const) {
+		const verdict = await gateRunner({ shell: fakeShell({ execute }) })(GATE, project, 1_000);
+		check(label, notRun(verdict, cause), verdict);
+	}
+	const unresolvable = fakeShell();
+	unresolvable.resolve = () => {
+		throw new Error("bad shell config");
+	};
+	const unresolved = await gateRunner({ shell: unresolvable })(GATE, project, 1_000);
+	check("B6a a request the shell cannot resolve", notRun(unresolved, "bad shell config"), unresolved);
+
+	for (const [label, end] of [
+		["B6a an execute", () => Promise.reject(new Error("cut off"))],
+		["B6c a result", async () => unrunnable(new Error("cut off"))],
+	] as const) {
+		const controller = new AbortController();
+		const execute = () => {
+			controller.abort();
+			return end();
+		};
+		const verdict = await gateRunner({ shell: fakeShell({ execute }) })(GATE, project, 1_000, controller.signal);
+		check(`${label} rejecting after an abort is aborted`, verdict.output === "aborted" && !verdict.ran, verdict);
+	}
+
+	const controller = new AbortController();
+	setTimeout(() => controller.abort(), 50);
+	const stopped = await run("sleep 30", project, 60_000, controller.signal);
+	check("B6d an abort mid-gate stops the command", notRun(stopped, "aborted"), stopped);
+}
+
+async function testGateRunnerTimeouts(): Promise<void> {
+	const startedAt = Date.now();
+	const real = await gateRunner()("echo started; sleep 30", project, 200);
+	check(
+		"B6b a running gate is killed at its timeout, keeping its output",
+		outOfTime(real) && real.output?.startsWith("started\n") === true && Date.now() - startedAt < 10_000,
+		real,
+	);
+
+	mock.timers.enable({ apis: ["setTimeout"] });
+	try {
+		const pass = async (ms: number) => {
+			await turn();
+			mock.timers.tick(ms);
+			await turn();
+		};
+		const start = (execute: (spec: DshShellSpec) => Promise<DshShellExecution>, signal?: AbortSignal) => {
+			const shell = fakeShell({ execute });
+			const state: { verdict?: GateVerdict } = {};
+			void gateRunner({ shell })(GATE, project, 700_000, signal).then((verdict) => {
+				state.verdict = verdict;
+			});
+			return { shell, state };
+		};
+
+		const slow = held();
+		const capped = start(async () => slow.execution);
+		await pass(600_000);
+		check(
+			"B6b a timeout above the shell's cap is not cut to it",
+			capped.shell.specs[0]?.timeoutMs === 600_000 && capped.state.verdict === undefined && slow.seen.kills === 0,
+			capped.state,
+		);
+		await pass(100_000);
+		check(
+			"B6b the timeout kills and then waits for the result",
+			slow.seen.kills === 1 && capped.shell.specs[0]?.signal?.aborted === true && capped.state.verdict === undefined,
+			{ seen: slow.seen, state: capped.state },
+		);
+		slow.end({ exitCode: null, aborted: true, stdout: collected("partial") });
+		await turn();
+		check(
+			"B6b a result that settles after the kill gives the timed-out verdict",
+			outOfTime(capped.state.verdict) && capped.state.verdict?.output === "partial\n[gate timed out]",
+			capped.state,
+		);
+
+		const stuck = held();
+		const unsettled = start(async () => stuck.execution);
+		await pass(700_000);
+		await pass(9_999);
+		const early = unsettled.state.verdict;
+		await pass(1);
+		check(
+			"B6b a result that never settles is given up after 10 s",
+			early === undefined && outOfTime(unsettled.state.verdict),
+			unsettled.state,
+		);
+
+		const late = held();
+		let publish: () => void = () => {};
+		const pending = start(
+			() =>
+				new Promise((resolve) => {
+					publish = () => resolve(late.execution);
+				}),
+		);
+		await pass(700_000);
+		await pass(10_000);
+		check("B6b the timeout covers a pending execute", outOfTime(pending.state.verdict), pending.state);
+		publish();
+		await turn();
+		check("B6b a command published after the timeout is killed", late.seen.kills === 1, late.seen);
+
+		const preparing = start(
+			(spec) =>
+				new Promise((_, reject) => {
+					spec.signal?.addEventListener("abort", () => reject(spec.signal?.reason));
+				}),
+		);
+		await pass(700_000);
+		check("B6b a preparation cut by the timeout is timed out", outOfTime(preparing.state.verdict), preparing.state);
+
+		const own = held();
+		own.end({ exitCode: null, timedOut: true });
+		const expired = start(async () => own.execution);
+		await turn();
+		check("B6b a result the shell timed out is timed out", outOfTime(expired.state.verdict) && own.seen.kills === 1, {
+			state: expired.state,
+			seen: own.seen,
+		});
+
+		const controller = new AbortController();
+		const ignoring = held();
+		const abandoned = start(async () => ignoring.execution, controller.signal);
+		await turn();
+		controller.abort();
+		await pass(10_000);
+		check(
+			"B6 an aborted command that never ends is killed and given up after 10 s",
+			notRun(abandoned.state.verdict, "aborted") && ignoring.seen.kills === 1,
+			{ state: abandoned.state, seen: ignoring.seen },
+		);
+
+		const cancelPreparing = new AbortController();
+		const unwanted = held();
+		let publishUnwanted: () => void = () => {};
+		const cut = start(
+			() =>
+				new Promise((resolve) => {
+					publishUnwanted = () => resolve(unwanted.execution);
+				}),
+			cancelPreparing.signal,
+		);
+		await turn();
+		cancelPreparing.abort();
+		await pass(10_000);
+		check("B6 an abort does not wait on a pending execute", notRun(cut.state.verdict, "aborted"), cut.state);
+		publishUnwanted();
+		await turn();
+		check("B6 a command published after an abort is killed", unwanted.seen.kills === 1, unwanted.seen);
+
+		const cancelPassing = new AbortController();
+		const passing = held();
+		const overtaken = start(async () => passing.execution, cancelPassing.signal);
+		await turn();
+		cancelPassing.abort();
+		passing.end();
+		await turn();
+		check("B6 a command that passes after the abort is still aborted", notRun(overtaken.state.verdict, "aborted"), {
+			state: overtaken.state,
+		});
+
+		const probed = (execute: () => Promise<DshShellExecution>) => {
+			const host = dshHost({ shell: fakeShell({ execute }) });
+			const state: { rejection?: Awaited<ReturnType<typeof gateCheck>> } = {};
+			void gateCheck(host.ctx, host.parent, project, new AbortController().signal).then((rejection) => {
+				state.rejection = rejection;
+			});
+			return state;
+		};
+		const refusedAtDeadline = ({ rejection }: ReturnType<typeof probed>): boolean =>
+			rejection?.reason === "sandbox-unavailable" && rejection.message.includes("timed out after 10000 ms");
+
+		const unprepared = probed(() => new Promise<DshShellExecution>(() => {}));
+		await pass(10_000);
+		check("A5c a probe that is never prepared is refused at its deadline", refusedAtDeadline(unprepared), unprepared);
+
+		const hung = held();
+		const unfinished = probed(async () => hung.execution);
+		await pass(10_000);
+		check(
+			"A5c a probe that never ends is killed and refused",
+			refusedAtDeadline(unfinished) && hung.seen.kills === 1,
+			{
+				state: unfinished,
+				seen: hung.seen,
+			},
+		);
+
+		let publishProbe: (execution: DshShellExecution) => void = () => {};
+		const preparedLate = probed(
+			() =>
+				new Promise<DshShellExecution>((resolve) => {
+					publishProbe = resolve;
+				}),
+		);
+		await pass(10_000);
+		const lateProbe = held();
+		publishProbe(lateProbe.execution);
+		await turn();
+		check(
+			"A5c a probe prepared after its deadline is killed",
+			refusedAtDeadline(preparedLate) && lateProbe.seen.kills === 1,
+			lateProbe.seen,
+		);
+	} finally {
+		mock.timers.reset();
+	}
+}
+
+/** A fake shell that records every gate command and ends each with `gate`, which is given its ordinal. */
+function gateShell(gate: (spec: DshShellSpec, index: number) => Promise<DshShellExecution>) {
+	const gates: DshShellSpec[] = [];
+	const shell = fakeShell({
+		execute: async (spec) => {
+			if (spec.command !== GATE) return shExecution(spec);
+			gates.push(spec);
+			return gate(spec, gates.length - 1);
+		},
+	});
+	return { shell, gates };
+}
+
+const gateOf = (outcome: DshSolveOutcome) => (outcome.kind === "ran" ? outcome.result.gate : undefined);
+
+const convergedOf = (outcome: DshSolveOutcome) => (outcome.kind === "ran" ? outcome.result.converged : undefined);
+
+async function testServiceGateRuns(): Promise<void> {
+	const policy: DshExecutionPolicy = { mode: "workspace-write", workspaceRoot: project, sessionId: "parent-session" };
+	const through = gateShell(async (spec) => shExecution(spec));
+	const passed = await dshHost({ shell: through.shell, sandboxPolicy: { resolve: () => policy } }).solve({
+		cwd: "sub",
+		gate: GATE,
+	});
+	check(
+		"every gate goes through the shell, in the run path under the parent's policy",
+		convergedOf(passed) === true &&
+			gateOf(passed)?.passed === true &&
+			through.gates.length > 0 &&
+			through.gates.every(
+				(spec) =>
+					spec.workdir === join(project, "sub") && spec.sandboxPolicy === policy && spec.onExpiry === "none",
+			),
+		{ passed, gates: through.gates },
+	);
+
+	const unusable = rejection("no sandbox backend is usable", "SANDBOX_UNAVAILABLE");
+	const broken = gateShell(async () => unrunnable(unusable));
+	const unconverged = await dshHost({ shell: broken.shell }).solve({ gate: GATE });
+	check(
+		"a gate the runner cannot confine does not converge",
+		convergedOf(unconverged) === false && notRun(gateOf(unconverged), "no sandbox backend is usable"),
+		unconverged,
+	);
+
+	const thrown = gateShell(async (spec) => shExecution(spec));
+	const offline = await dshHost({
+		shell: thrown.shell,
+		sandboxPolicy: changingPolicy("workspace-write", "workspace-write", new Error("policy store offline")),
+	}).solve({ gate: GATE });
+	check(
+		"B3 a policy that fails at gate time runs nothing and does not converge",
+		convergedOf(offline) === false && notRun(gateOf(offline), "policy store offline") && thrown.gates.length === 0,
+		offline,
+	);
+
+	let mode = "workspace-write";
+	const narrowing = gateShell(async () => {
+		const first = mode === "workspace-write";
+		mode = "read-only";
+		return settled({ exitCode: first ? 1 : 0 });
+	});
+	await dshHost({
+		shell: narrowing.shell,
+		sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: project }) },
+	}).solve({ gate: GATE });
+	const modes = narrowing.gates.map((spec) => spec.sandboxPolicy?.mode);
+	check(
+		"a mode narrowed mid-run applies to the next gate",
+		modes.length > 1 && modes[0] === "workspace-write" && modes.slice(1).every((next) => next === "read-only"),
+		modes,
+	);
+
+	const slow = gateShell(async (spec) => shExecution({ ...spec, command: "sleep 30" }));
+	const timedOut = await dshHost({ shell: slow.shell }).solve({ gate: GATE }, "gateTimeoutMs = 100\n[dsh]\n");
+	check(
+		"the configured gate timeout stops the gate",
+		convergedOf(timedOut) === false && outOfTime(gateOf(timedOut) ?? undefined),
+		timedOut,
+	);
+
+	const controller = new AbortController();
+	const aborting = gateShell(async (spec) => {
+		setTimeout(() => controller.abort(), 50);
+		return shExecution({ ...spec, command: "sleep 30" });
+	});
+	const aborted = await dshHost({ shell: aborting.shell }).solve({ gate: GATE, signal: controller.signal });
+	check(
+		"an abort mid-gate ends the run as aborted",
+		aborted.kind === "ran" &&
+			aborted.result.stop === "aborted" &&
+			notRun(gateOf(aborted), "aborted") &&
+			lockFree(project),
+		aborted,
+	);
+}
+
+async function testServiceGateOrdering(): Promise<void> {
+	const llm = fakeLlm((config) => (config.model === "missing" ? new Error("no such model") : undefined));
+	const brokenPresets = { resolve: async () => ({ broken: "unknown preset" }) };
+	const shellless = { shell: undefined, llm: llm.llm };
+	const full = { ...shellless, sandboxPolicy: sandbox("danger-full-access") };
+	for (const [label, services, request, expected] of [
+		["a bad model ref", shellless, { workerModel: "bare" }, "rejected bad-model-ref"],
+		["a bad run directory", shellless, { cwd: "absent" }, "rejected cwd-unavailable"],
+		["containment", shellless, { cwd: beside }, "rejected cwd-outside-workspace"],
+		["the git check", full, { cwd: root }, "rejected not-git"],
+		["the plan file", shellless, { planFile: "absent.md" }, "rejected bad-plan-file"],
+		["a refused model", shellless, { workerModel: "stub/missing" }, "rejected model-refused"],
+		[
+			"a broken preset",
+			{ ...shellless, agentPresets: brokenPresets },
+			{ gate: "true" },
+			"rejected presets-unavailable",
+		],
+	] as const) {
+		const host = dshHost(services);
+		const earlier = await host.solve(request);
+		const later = await dshHost({ shell: undefined }).solve();
+		check(
+			`${label} is refused before the gate is checked`,
+			endOf(earlier) === expected && endOf(later) === "rejected gate-unavailable",
+			{ earlier, later },
+		);
+	}
+	const shell = fakeShell();
+	await dshHost({ shell, llm: llm.llm }).solve({ workerModel: "stub/missing" });
+	const unprobed = shell.specs.length;
+	await dshHost({ shell, llm: llm.llm }).solve({ gate: GATE });
+	check("a call refused earlier is never probed", unprobed === 0 && probes(shell).length === 1, shell.specs);
+}
+
 async function testServiceAbort(): Promise<void> {
 	const refs = { managerModel: "stub/mgr", workerModel: "stub/wrk" };
 	for (const step of ["ledger-manager", "ledger-worker", "mgr", "wrk"]) {
@@ -1813,8 +2596,8 @@ async function testServiceFailed(): Promise<void> {
 	check("a throwing spawner releases the lock", lockFree(project));
 
 	const gate = dshHost();
-	await checkRefused("a throw during the run is failed", "failed", gate, () => gate.solve({ gate: 5 }));
-	check("a throw during the run releases the lock", lockFree(project));
+	await checkRefused("a gate that is not a string is failed", "failed", gate, () => gate.solve({ gate: 5 }));
+	check("a gate that is not a string leaves the lock free", lockFree(project));
 
 	const blocked = dshHost();
 	const session = { ...blocked.parent.session, id: "blocked" };
@@ -2421,6 +3204,14 @@ async function run(): Promise<void> {
 	await testServiceDirectory();
 	await testServiceTreeAndPlan();
 	await testServiceModels();
+	await testServiceGateShell();
+	await testServiceGatePolicy();
+	await testServiceGateProbe();
+	await testServiceGateOrdering();
+	await testGateRunnerRefusals();
+	await testGateRunnerResults();
+	await testGateRunnerTimeouts();
+	await testServiceGateRuns();
 	await testServiceAbort();
 	await testServiceBusy();
 	await testServiceFailed();

@@ -191,13 +191,15 @@ async function dispose(activation: DshSubagentActivation): Promise<void> {
 	} catch {}
 }
 
-async function waitAtMost(work: Promise<void>, ms: number): Promise<void> {
+/** `work`'s value, or undefined once `ms` pass first. `work` must not reject. */
+export async function waitAtMost<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
 	let handle: ReturnType<typeof setTimeout> | undefined;
-	const limit = new Promise<void>((resolve) => {
-		handle = setTimeout(resolve, ms);
+	const limit = new Promise<undefined>((resolve) => {
+		handle = setTimeout(() => resolve(undefined), ms);
 	});
-	await Promise.race([work, limit]);
+	const value = await Promise.race([work, limit]);
 	clearTimeout(handle);
+	return value;
 }
 
 function settledResult(role: DshRole, result: DshSubagentResult, turnError: string | undefined): SpawnResult {

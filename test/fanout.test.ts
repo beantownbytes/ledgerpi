@@ -151,6 +151,8 @@ interface RunSpec {
 	signal?: AbortSignal;
 	/** The `ask` consent callback; absent means there is no way to ask. */
 	confirm?: LoopDeps["confirmFanout"];
+	/** Replaces the loop's own gate runner. */
+	runGate?: LoopDeps["runGate"];
 }
 
 interface Run {
@@ -189,6 +191,7 @@ async function runCase(spec: RunSpec): Promise<Run> {
 		workerModel: null,
 		fanout: spec.override,
 		confirmFanout: spec.confirm,
+		runGate: spec.runGate,
 		onProgress: (_iter, label) => progress.push(label),
 		signal: spec.signal,
 	});
@@ -1462,6 +1465,94 @@ async function case27PlanRetry(): Promise<void> {
 	);
 }
 
+async function case28GateHook(): Promise<void> {
+	const repo = newRepo("c28");
+	const seen: { command: string; cwd: string; timeoutMs: number; signaled: boolean; candidate: string[] }[] = [];
+	const stop = new AbortController();
+	const run = await runCase({
+		name: "c28",
+		repo,
+		config: "on",
+		n: 2,
+		maxIters: 2,
+		signal: stop.signal,
+		runGate: async (command, cwd, timeoutMs, signal) => {
+			const candidate = readdirSync(cwd).filter((f) => f.startsWith("cand"));
+			seen.push({ command, cwd, timeoutMs, signaled: signal === stop.signal, candidate });
+			return { ran: true, passed: false, command, output: "hook says no" };
+		},
+		script: {
+			manage: (n) => {
+				if (n === 1) return managerReply("done", "");
+				return managerReply("continue", `task ${n}`, n === 2 ? "best-of-n: uncertain" : undefined);
+			},
+			work: (c) => {
+				if (isCandidate(c)) writeFileSync(join(c.cwd, `cand${candidateIndex(c)}.txt`), "");
+				return ok(WORKED);
+			},
+		},
+	});
+	check(
+		"28 gate hook: it takes the first, per-round, every candidate and final gate, and the default runner takes none",
+		seen.length === 5 &&
+			gateExecutions("c28") === 0 &&
+			run.result.timing.gateRuns === 5 &&
+			run.rows.filter((r) => r.role === "gate").length === 5,
+		[seen, gateExecutions("c28"), run.result.timing],
+	);
+	check(
+		"28 gate hook: it gets the gate command, the run directory, the gate timeout and the run's signal",
+		seen.length > 0 &&
+			seen.every((g) => g.command === gateFor("c28") && g.cwd === repo && g.timeoutMs === 20_000 && g.signaled),
+		seen,
+	);
+	check(
+		"28 gate hook: each candidate's patch is in the tree while its gate runs",
+		JSON.stringify(
+			seen
+				.slice(2, 4)
+				.map((g) => g.candidate.join())
+				.sort(),
+		) === JSON.stringify(["cand1.txt", "cand2.txt"]),
+		seen,
+	);
+	check(
+		"28 gate hook: its verdict is the loop's verdict",
+		!run.result.converged && run.result.gate?.output === "hook says no",
+		run.result,
+	);
+}
+
+async function case29GateHookRejects(): Promise<void> {
+	const repo = newRepo("c29");
+	const run = await runCase({
+		name: "c29",
+		repo,
+		config: "on",
+		n: 2,
+		maxIters: 1,
+		runGate: () => Promise.reject(new Error("runner unavailable")),
+		script: {
+			manage: (n) =>
+				n === 1 ? managerReply("continue", "make it pass", "best-of-n: uncertain") : managerReply("done", ""),
+			work: passingWorker,
+		},
+	});
+	const attempts = run.rows.find((r) => r.role === "fanout")?.attempts as { outcome: string }[] | undefined;
+	check(
+		"29 gate hook rejects: the verdict is not run and not passed, with the command and the error text",
+		JSON.stringify(run.result.gate) ===
+			JSON.stringify({ ran: false, passed: false, command: gateFor("c29"), output: "runner unavailable" }),
+		run.result.gate,
+	);
+	check(
+		"29 gate hook rejects: no candidate counts as a pass and the run does not converge",
+		JSON.stringify(attempts?.map((a) => a.outcome).sort()) === JSON.stringify(["gate-red", "kept-red"]) &&
+			!run.result.converged,
+		[attempts, run.result],
+	);
+}
+
 async function main(): Promise<void> {
 	mkdirSync(root, { recursive: true });
 	writeFileSync(configFile, `stateDir = "${stateDir}"\nproviders = ["test"]\n`);
@@ -1494,6 +1585,8 @@ async function main(): Promise<void> {
 	case25LowerAsk();
 	await case26AskLatchAndUnknownAnswer();
 	await case27PlanRetry();
+	await case28GateHook();
+	await case29GateHookRejects();
 
 	rmSync(root, { recursive: true, force: true });
 	console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);
