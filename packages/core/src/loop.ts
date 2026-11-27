@@ -1,6 +1,6 @@
 import { type FanoutSetting, type LedgerpiConfig, lowerFanout } from "./config.ts";
 import { type Candidate, chooseMode, type FanoutAnswer, type RoundMode, runBestOfN } from "./fanout.ts";
-import { type GateVerdict, runGate } from "./gate.ts";
+import { type GateRunner, type GateVerdict, runGate } from "./gate.ts";
 import { pruneStaleCandidates, workingDiff } from "./git.ts";
 import type { Ledger } from "./ledger.ts";
 import {
@@ -141,6 +141,11 @@ export interface LoopDeps {
 	task: string;
 	/** The detected gate command, or undefined to run without a verifier. */
 	gateCommand?: string;
+	/**
+	 * Runs every gate of the run in place of `runGate`. A rejection counts as a gate
+	 * that never ran.
+	 */
+	runGate?: GateRunner;
 	/** The session's `provider/modelId`, which an unpinned role inherits; null when unknown. Labels only. */
 	sessionModel: string | null;
 	/** The `provider/modelId` the manager role spawns on, or null for the session model. */
@@ -298,7 +303,9 @@ async function runRounds(
 		}, GATE_TICK_MS);
 		ticker.unref();
 		try {
-			return await runGate(command, cwd, cfg.gateTimeoutMs, signal);
+			return await (deps.runGate ?? runGate)(command, cwd, cfg.gateTimeoutMs, signal);
+		} catch (err) {
+			return { ran: false, passed: false, command, output: err instanceof Error ? err.message : String(err) };
 		} finally {
 			clearInterval(ticker);
 			timing.gateMs += Date.now() - startedAt;

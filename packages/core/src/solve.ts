@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { type AuditMeta, auditRun } from "./audit.ts";
 import { asFanoutSetting, type LedgerpiConfig } from "./config.ts";
 import { readPlanFile } from "./files.ts";
-import { detectGate } from "./gate.ts";
+import { detectGate, type GateRunner } from "./gate.ts";
 import { headInfo, isGitRepo, workTreeRoot } from "./git.ts";
 import { handoffBlock } from "./handoff.ts";
 import { Ledger } from "./ledger.ts";
@@ -56,7 +56,7 @@ export type SolveCheck = () => SolveRejection | null | Promise<SolveRejection | 
  * run directory (`args.cwd` arrives absolute, and a harness that contains it passes
  * its real path), containment, the model refs, their efforts, and the presets.
  * `solveTask` owns the blank task, the git work tree, the plan file, the fan-out
- * warning, the lock, the run and its audit row.
+ * warning, the gate command, the lock, the run and its audit row.
  */
 export interface SolveHost {
 	harness: SolveHarness;
@@ -82,8 +82,15 @@ export interface SolveHost {
 	checkArgs?: SolveCheck;
 	/** Run once the work tree is known to be a git repository. */
 	checkTree?: SolveCheck;
-	/** The last check before the lock is taken. */
+	/** The harness's last check of the call itself, before the gate command is looked at. */
 	beforeLock?: SolveCheck;
+	/**
+	 * The last check before the lock is taken: whether the run's gate command can be
+	 * run. Skipped when the run has no gate.
+	 */
+	checkGate?: (command: string) => ReturnType<SolveCheck>;
+	/** Runs the run's gates; the loop's own runner when absent. */
+	runGate?: GateRunner;
 }
 
 /** A finished run: the loop's result and what the run cost and used. */
@@ -182,6 +189,12 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 		if (host.signal.aborted) return { kind: "canceled" };
 		if (problem !== null) return { kind: "rejected", ...problem };
 	}
+	const gateCommand = args.gate?.trim() || detectGate(cfg, args.cwd);
+	if (gateCommand && host.checkGate) {
+		const problem = await host.checkGate(gateCommand);
+		if (host.signal.aborted) return { kind: "canceled" };
+		if (problem !== null) return { kind: "rejected", ...problem };
+	}
 	if (host.signal.aborted) return { kind: "canceled" };
 	// A dsh run lives inside the dsh server, so stopping it must not signal that process.
 	const release = acquireLock(cfg.stateDir, root, { sharedProcess: host.harness === "dsh" });
@@ -198,7 +211,8 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 			ledger,
 			cwd: args.cwd,
 			task,
-			gateCommand: args.gate?.trim() || detectGate(cfg, args.cwd),
+			gateCommand,
+			runGate: host.runGate,
 			sessionModel: host.sessionModel,
 			managerModel: host.managerModel,
 			workerModel: host.workerModel,

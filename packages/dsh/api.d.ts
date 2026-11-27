@@ -37,7 +37,12 @@ export interface DshSolveRequest {
 	task: string;
 	/** The run directory; a relative one is resolved against the parent's working directory. */
 	cwd?: string;
-	/** The gate command; absent means the configured or detected one. */
+	/**
+	 * The gate command; absent means the configured or detected one. Whichever it is,
+	 * each gate run goes through dsh's shell (`bash -c`) under the parent session's
+	 * sandbox policy, resolved again for that run. Under `danger-full-access` that
+	 * policy bounds nothing.
+	 */
 	gate?: string;
 	/** A plan file; a relative path is resolved against the run directory. */
 	planFile?: string;
@@ -56,12 +61,16 @@ export interface DshSolveRequest {
 
 /** What the gate did, if one ran. */
 export interface DshGateVerdict {
-	/** Whether a gate was run at all. When false the manager's own verdict stands. */
+	/**
+	 * Whether the gate command ran to a verdict. False when it was aborted or could not
+	 * be run, including when it could not be held to the parent's sandbox; a run that
+	 * ends on such a verdict has not converged.
+	 */
 	ran: boolean;
 	/** True only when the gate command exited zero. */
 	passed: boolean;
 	command?: string;
-	/** A tail of combined stdout/stderr on failure. */
+	/** A tail of combined stdout/stderr on failure, or why the gate did not run. */
 	output?: string;
 }
 
@@ -137,7 +146,14 @@ export interface DshLockHolder {
 
 /** Why a call was turned down. */
 export interface DshSolveRejection {
-	/** A stable code for the cause. */
+	/**
+	 * A stable code for the cause. A run that has a gate is also turned down, before
+	 * the work tree is locked, when the gate cannot be held to the parent's sandbox:
+	 * `gate-unavailable` (no shell service), `gate-unconfined` (the sandbox mode
+	 * confines but the shell does not sandbox commands) or `sandbox-unavailable` (no
+	 * sandbox policy service, a policy that cannot be resolved, an unknown mode, or a
+	 * confining mode under which a command that does nothing fails).
+	 */
 	reason: string;
 	message: string;
 	/** The request property at fault, when one is. */

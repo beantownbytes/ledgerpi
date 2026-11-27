@@ -16,7 +16,6 @@ import {
 	type DshCreatedAgent,
 	type DshPluginContext,
 	type DshRole,
-	type DshSandboxPolicy,
 	type DshToolExecution,
 	type DshTools,
 	isWithin,
@@ -25,6 +24,7 @@ import {
 	parentRoute,
 	realPathOrNull,
 } from "./dsh.ts";
+import { dshGateRunner, gateCheck, sessionPolicy } from "./gate.ts";
 import { createDshSpawner, type DshRoles, dshRoles, errorText } from "./spawn.ts";
 
 const ROLES: readonly DshRole[] = ["manager", "worker"];
@@ -125,14 +125,9 @@ function runDirectory(ctx: DshPluginContext, parent: DshAgent, cwd: unknown): Ru
  */
 function containment(ctx: DshPluginContext, parent: DshAgent, runPath: string): SolveRejection | null {
 	const unavailable = (message: string): SolveRejection => ({ reason: "sandbox-unavailable", message });
-	const sandbox = ctx.get("sandboxPolicy");
-	if (sandbox === undefined) return unavailable("No sandbox policy service is available to contain the run.");
-	let policy: ReturnType<DshSandboxPolicy["resolve"]>;
-	try {
-		policy = sandbox.resolve({ session: parent.session });
-	} catch (err) {
-		return unavailable(`The sandbox policy cannot be resolved: ${errorText(err)}`);
-	}
+	const resolution = sessionPolicy(ctx, parent);
+	if (resolution.kind === "unavailable") return unavailable(resolution.message);
+	const { policy } = resolution;
 	switch (policy.mode) {
 		case "danger-full-access":
 			return null;
@@ -269,6 +264,8 @@ async function attempt(
 				return containment(ctx, parent, run.path);
 			},
 			beforeLock: () => modelsProblem(state.presets, roles, requested, signal),
+			checkGate: () => gateCheck(ctx, parent, runPath, signal),
+			runGate: dshGateRunner(ctx, parent),
 		},
 	);
 }

@@ -676,7 +676,7 @@ not stop the call).
 | --- | --- | --- |
 | `inactive` | `reason` | The service is not running anything; the reasons are those of `status()`. |
 | `canceled` | | `signal` aborted before the loop started. |
-| `rejected` | `reason`, `message`, `field?` | The call was turned down. `reason` is `no-parent`, `nested`, `blank-task`, `bad-model-ref`, `cwd-unavailable`, `sandbox-unavailable`, `read-only-session`, `cwd-outside-workspace`, `not-git`, `bad-plan-file`, `presets-unavailable`, or `model-refused`. `field` names the request property at fault, when there is one. |
+| `rejected` | `reason`, `message`, `field?` | The call was turned down. `reason` is `no-parent`, `nested`, `blank-task`, `bad-model-ref`, `cwd-unavailable`, `sandbox-unavailable`, `read-only-session`, `cwd-outside-workspace`, `not-git`, `bad-plan-file`, `presets-unavailable`, `model-refused`, `gate-unavailable`, or `gate-unconfined`. `field` names the request property at fault, when there is one. |
 | `busy` | `root`, `holder` | Another loop holds the work tree; `holder` is `{ pid }`, or `null` when unknown. |
 | `ran` | `result`, `handoff` | The loop ran. An abort after it started also ends here, with `result.stop: "aborted"`. |
 | `failed` | `message` | Something unexpected was thrown. Edits already made may remain in the tree. |
@@ -709,11 +709,37 @@ parent session's sandbox mode decides whether it may be used:
 - A command a worker puts in the background with `&` is not stopped when the worker ends, and
   can still write after the run returns.
 
-**The gate runs unsandboxed, with host privileges.** The host runs it directly through
-`/bin/sh`, outside dsh's sandbox and with no approval, and what it runs comes from files in
-the work tree. A sandboxed parent can write a Makefile (or `.ledgerpi-gate`) and have
-`ledger_solve` run it unsandboxed, and a worker can edit whatever the gate executes.
-**dsh's sandbox does not contain a hostile worker.** Offer the tool and the service only
+**The gate.** What the gate runs comes from files in the work tree, so it is held to the
+parent session's sandbox. Its policy is resolved again for every gate run, so a change of
+mode applies from the next one.
+
+- The gate runs through dsh's shell, as `bash -c` rather than `/bin/sh`, in dsh's scrubbed
+  environment: the server's `DSH_*` variables, and those whose names contain `KEY`,
+  `PASSWORD`, `SECRET`, or `TOKEN`, are not passed on.
+- Its writable set is the session's, not the run directory's. **Under `workspace-write`, a
+  write outside it (such as to a package cache under the home directory) is denied, so a
+  gate that depends on one fails.** The verdict follows the exit status: a gate that
+  ignores a denied write and exits 0 passes.
+- Where dsh reports its enforcement as `partial`, the gate still runs. Under
+  `danger-full-access` there is no boundary.
+- A worker can still edit whatever the gate executes. That code runs inside the sandbox,
+  with the session's writable set, which can be wider than the worker's.
+
+A run that has a gate is rejected before the lock when the gate cannot be held to the
+sandbox. Under `workspace-write` and `read-only`, a command that does nothing is tried
+first, for at most 10 seconds.
+
+| `reason` | Cause |
+| --- | --- |
+| `gate-unavailable` | There is no shell service. The shipped worker preset needs one, so such a deployment is normally refused earlier, as `presets-unavailable`. |
+| `gate-unconfined` | The mode is `workspace-write` or `read-only`, but the shell does not sandbox commands. |
+| `sandbox-unavailable` | There is no usable sandbox policy, the mode is unknown, or the trial command failed. |
+
+A gate that can no longer be held to the sandbox during a run is not run, and cannot pass.
+`result.gate.output` says why; the hand-off says only that the gate did not run.
+
+**ledgerpi's own `git` calls on the host are not sandboxed, so the run as a whole is still
+not a boundary against a hostile session or worker.** Offer the tool and the service only
 where that is acceptable.
 
 ### Running alongside other work

@@ -15,6 +15,17 @@ export interface GateVerdict {
 	output?: string;
 }
 
+/**
+ * Runs the gate command in `cwd`, giving it `timeoutMs` and stopping it when
+ * `signal` fires. Every failure resolves as a verdict; it never rejects.
+ */
+export type GateRunner = (
+	command: string,
+	cwd: string,
+	timeoutMs: number,
+	signal?: AbortSignal,
+) => Promise<GateVerdict>;
+
 /** A gate command for prose: inline code for one line, a fenced block for several. */
 export function gateCommandText(command: string): string {
 	return command.includes("\n") ? `\n\`\`\`sh\n${command}\n\`\`\`\n` : `\`${command}\``;
@@ -77,6 +88,16 @@ export function detectGate(cfg: LedgerpiConfig, cwd: string): string | undefined
 
 const OUTPUT_TAIL_CHARS = 3_000;
 
+/** The end of a gate's combined output, as much of it as a verdict carries. */
+export function outputTail(out: string): string {
+	return out.slice(-OUTPUT_TAIL_CHARS);
+}
+
+/** The verdict for a gate that outlived its timeout: run and failed, with the tail of `out`. */
+export function timedOutVerdict(command: string, out: string): GateVerdict {
+	return { ran: true, passed: false, command, output: `${outputTail(out)}\n[gate timed out]` };
+}
+
 /** Runs the gate command in cwd and reports the verdict. Never throws. */
 export function runGate(command: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<GateVerdict> {
 	return new Promise((resolve) => {
@@ -120,7 +141,7 @@ export function runGate(command: string, cwd: string, timeoutMs: number, signal?
 
 		const timer = setTimeout(() => {
 			killTree();
-			finish({ ran: true, passed: false, command, output: `${out.slice(-OUTPUT_TAIL_CHARS)}\n[gate timed out]` });
+			finish(timedOutVerdict(command, out));
 		}, timeoutMs);
 
 		if (signal) {
@@ -145,7 +166,7 @@ export function runGate(command: string, cwd: string, timeoutMs: number, signal?
 				ran: true,
 				passed: code === 0,
 				command,
-				output: code === 0 ? undefined : out.slice(-OUTPUT_TAIL_CHARS),
+				output: code === 0 ? undefined : outputTail(out),
 			});
 		});
 	});
