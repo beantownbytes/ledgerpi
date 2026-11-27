@@ -738,9 +738,35 @@ first, for at most 10 seconds.
 A gate that can no longer be held to the sandbox during a run is not run, and cannot pass.
 `result.gate.output` says why; the hand-off says only that the gate did not run.
 
-**ledgerpi's own `git` calls on the host are not sandboxed, so the run as a whole is still
-not a boundary against a hostile session or worker.** Offer the tool and the service only
-where that is acceptable.
+**ledgerpi's own `git` calls on the host are hardened but not sandboxed, so the run as a
+whole is still not a boundary against a hostile session or worker.**
+
+- The run directory's git dir and work tree are pinned once, at the start of a run. Each
+  fan-out candidate is pinned when it is created, and that pin is also used to remove it. No
+  later snapshot, diff, patch, or worktree step of the run follows the `.git` file of the
+  run's work tree or of a candidate.
+- Every call turns off fsmonitor, hooks-dir hooks, and the `post-index-change`,
+  `post-checkout`, and `reference-transaction` config hooks. Diffs pass
+  `--no-ext-diff --no-textconv --ignore-submodules=dirty --submodule=short`.
+- Snapshots record each checked-out tracked submodule from its HEAD, under sparse checkout
+  too, so no git process starts inside a submodule. A submodule with no commit checked out
+  keeps its recorded commit. A submodule marked `ignore = all` is recorded from its HEAD,
+  even where plain `git add` would skip it. A submodule path that is not valid UTF-8 fails the
+  snapshot.
+
+What remains:
+
+- Configured clean, smudge, and process filters still run, and a worker's `.gitattributes`
+  can apply them to any file.
+- A session or worker that can write the repo's git dir (config, hooks, a linked worktree's
+  admin dir) is not contained, so dsh must keep it read-only.
+- A `.git` file or directory that a worker leaves in the run directory, or in a directory
+  above it inside the work tree, does not redirect the current run, and neither does a
+  rewrite of the `.git` file of a linked worktree or submodule checkout. Nothing removes or
+  restores it, and the next git command there follows it, running whatever that git dir
+  configures. The next ledgerpi run follows it too, and runs its filters.
+
+Offer the tool and the service only where that is acceptable.
 
 ### Running alongside other work
 

@@ -6,13 +6,12 @@ import {
 	addCandidateWorktree,
 	applyPatch,
 	candidatePatch,
-	candidatePath,
+	type RepoPin,
 	removeCandidateWorktree,
 	revertPatch,
 	snapshotTree,
 	trackedTreeId,
 	treeId,
-	workTreeRoot,
 } from "./git.ts";
 import type { FanoutMode } from "./parse.ts";
 import { report } from "./report.ts";
@@ -75,8 +74,8 @@ export interface Attempt {
 export interface Candidate {
 	/** 1-based candidate number. */
 	index: number;
-	/** The worktree root; the only place this candidate may edit. */
-	worktree: string;
+	/** The candidate's pinned worktree; its root is the only place this candidate may edit. */
+	repo: RepoPin;
 	/** The directory the worker spawns in: the worktree path matching the real cwd. */
 	cwd: string;
 }
@@ -100,6 +99,8 @@ export type BestOfNResult =
 export interface BestOfNArgs {
 	/** The real working directory. */
 	cwd: string;
+	/** The pinned repository holding `cwd`. */
+	repo: RepoPin;
 	/** The ledger directory; candidates live under `<ledgerDir>/candidates`. */
 	ledgerDir: string;
 	/** The loop iteration, which names the candidate directories. */
@@ -140,7 +141,7 @@ export async function runBestOfN(a: BestOfNArgs): Promise<BestOfNResult> {
 	if (a.signal?.aborted) stop.abort();
 	else a.signal?.addEventListener("abort", relay, { once: true });
 
-	const created: string[] = [];
+	const created: RepoPin[] = [];
 	const running: Promise<Finished>[] = [];
 	const outcomes = new Map<number, AttemptOutcome>();
 	const attempts = (): Attempt[] =>
@@ -151,15 +152,13 @@ export async function runBestOfN(a: BestOfNArgs): Promise<BestOfNResult> {
 		let baseTree: string;
 		const candidates: Candidate[] = [];
 		try {
-			const root = workTreeRoot(a.cwd);
-			if (root === null) throw new Error(`${a.cwd} is not inside a git work tree`);
-			const subdir = relative(root, realpathSync(a.cwd));
-			base = snapshotTree(a.cwd);
-			baseTree = treeId(a.cwd, base);
+			const subdir = relative(a.repo.workTree, realpathSync(a.cwd));
+			base = snapshotTree(a.repo);
+			baseTree = treeId(a.repo, base);
 			for (let index = 1; index <= a.n; index++) {
-				created.push(candidatePath(a.ledgerDir, a.iter, index));
-				const worktree = addCandidateWorktree(a.cwd, a.ledgerDir, a.iter, index, base);
-				candidates.push({ index, worktree, cwd: join(worktree, subdir) });
+				const repo = addCandidateWorktree(a.repo, a.ledgerDir, a.iter, index, base);
+				created.push(repo);
+				candidates.push({ index, repo, cwd: join(repo.workTree, subdir) });
 			}
 		} catch (err) {
 			return { kind: "unavailable", reason: (err as Error).message };
@@ -182,7 +181,7 @@ export async function runBestOfN(a: BestOfNArgs): Promise<BestOfNResult> {
 		});
 		const revertOnAbort = (patch: Buffer) => {
 			try {
-				revertPatch(a.cwd, patch);
+				revertPatch(a.repo, patch);
 			} catch (err) {
 				report(`[ledgerpi] could not undo a candidate's changes after the abort: ${(err as Error).message}`);
 			}
@@ -198,23 +197,23 @@ export async function runBestOfN(a: BestOfNArgs): Promise<BestOfNResult> {
 					firstFailure ??= reply;
 					continue;
 				}
-				if (treeId(a.cwd) !== baseTree) return escaped("tree-changed", reply);
+				if (treeId(a.repo) !== baseTree) return escaped("tree-changed", reply);
 
 				let patch: Buffer;
 				try {
-					patch = candidatePatch(candidate.worktree, base);
-					applyPatch(a.cwd, patch);
+					patch = candidatePatch(candidate.repo, base);
+					applyPatch(a.repo, patch);
 				} catch {
 					outcomes.set(candidate.index, "apply-failed");
 					continue;
 				}
-				const applied = trackedTreeId(a.cwd);
+				const applied = trackedTreeId(a.repo);
 				const verdict = await a.runGate();
 				if (verdict === null) {
 					revertOnAbort(patch);
 					return { kind: "aborted", attempts: attempts() };
 				}
-				if (trackedTreeId(a.cwd) !== applied) return escaped("tree-changed", reply);
+				if (trackedTreeId(a.repo) !== applied) return escaped("tree-changed", reply);
 				if (verdict.ran && verdict.passed) {
 					outcomes.set(candidate.index, "kept");
 					return { kind: "kept", worker: reply, gate: verdict, attempts: attempts() };
@@ -222,17 +221,17 @@ export async function runBestOfN(a: BestOfNArgs): Promise<BestOfNResult> {
 				outcomes.set(candidate.index, "gate-red");
 				gated.push({ index: candidate.index, reply, patch, verdict });
 				try {
-					revertPatch(a.cwd, patch);
+					revertPatch(a.repo, patch);
 				} catch {
 					return escaped("revert-failed", reply);
 				}
 			}
 
-			if (treeId(a.cwd) !== baseTree) return escaped("tree-changed", null);
+			if (treeId(a.repo) !== baseTree) return escaped("tree-changed", null);
 			const first = gated[0];
 			if (first === undefined) return { kind: "failed", worker: firstFailure, attempts: attempts() };
 			try {
-				applyPatch(a.cwd, first.patch);
+				applyPatch(a.repo, first.patch);
 			} catch {
 				return escaped("reapply-failed", null);
 			}
@@ -245,6 +244,6 @@ export async function runBestOfN(a: BestOfNArgs): Promise<BestOfNResult> {
 		a.signal?.removeEventListener("abort", relay);
 		stop.abort();
 		await Promise.allSettled(running);
-		for (const path of created) removeCandidateWorktree(a.cwd, path);
+		for (const candidate of created) removeCandidateWorktree(a.repo, candidate);
 	}
 }

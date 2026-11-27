@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auditRun } from "../packages/core/src/audit.ts";
@@ -10,7 +10,7 @@ import { handoffBlock } from "../packages/core/src/handoff.ts";
 import { Ledger } from "../packages/core/src/ledger.ts";
 import { type LoopDeps, type LoopResult, type RoleTiming, runLoop } from "../packages/core/src/loop.ts";
 import type { SpawnFn, SpawnResult } from "../packages/core/src/spawn.ts";
-import { deadPid, TIMING_KEYS } from "./helpers.ts";
+import { deadPid, pinned, TIMING_KEYS } from "./helpers.ts";
 
 const root = join(tmpdir(), `ledgerpi-fanout-test-${process.pid}`);
 const stateDir = join(root, "state");
@@ -184,6 +184,7 @@ async function runCase(spec: RunSpec): Promise<Run> {
 		cfg,
 		ledger,
 		cwd: spec.repo,
+		repo: pinned(spec.repo),
 		task: "Make the gate pass.",
 		gateCommand: spec.gate === null ? undefined : (spec.gate ?? gateFor(spec.name)),
 		sessionModel: null,
@@ -233,7 +234,7 @@ async function case1Off(): Promise<void> {
 		"1 off: no extra worktrees and no candidates directory",
 		worktreeCount(repo) === 1 && !existsSync(join(run.ledger.dir, "candidates")),
 	);
-	check("1 off: the hand-off has no Fan-out line", !handoffBlock(repo, run.result).includes("Fan-out:"));
+	check("1 off: the hand-off has no Fan-out line", !handoffBlock(pinned(repo), run.result).includes("Fan-out:"));
 	check(
 		"1 off: no fan-out summary, no advice on the brief rows, no fan-out rows",
 		run.result.fanout === null &&
@@ -313,7 +314,7 @@ async function case2Advise(): Promise<void> {
 		TIMING_KEYS.every((k) => typeof audited[k] === "number" && audited[k] === t[k]),
 		[audited, t],
 	);
-	const handoff = handoffBlock(repo, run.result);
+	const handoff = handoffBlock(pinned(repo), run.result);
 	check(
 		"2 advise: the hand-off has exactly one Fan-out line with the recommendation",
 		handoff.split("\n").filter((l) => l.startsWith("Fan-out:")).length === 1 &&
@@ -443,7 +444,7 @@ async function case4NonePass(): Promise<void> {
 
 async function case5AllFail(): Promise<void> {
 	const repo = newRepo("c5");
-	const before = treeId(repo);
+	const before = treeId(pinned(repo));
 	const run = await runCase({
 		name: "c5",
 		repo,
@@ -469,7 +470,7 @@ async function case5AllFail(): Promise<void> {
 	);
 	check(
 		"5 all fail: the real tree is untouched and the worktrees are gone",
-		treeId(repo) === before && worktreeCount(repo) === 1 && candidateDirs(run.ledger).length === 0,
+		treeId(pinned(repo)) === before && worktreeCount(repo) === 1 && candidateDirs(run.ledger).length === 0,
 	);
 	check(
 		"5 all fail: the spawn-failure stop re-runs the gate and reports its verdict",
@@ -726,7 +727,7 @@ async function case9Abort(): Promise<void> {
 	const repoA = newRepo("c9a");
 	writeFileSync(join(repoA, "seed"), "1-dirty");
 	writeFileSync(join(repoA, "dirty.txt"), "untracked");
-	const baseA = treeId(repoA);
+	const baseA = treeId(pinned(repoA));
 	const abortA = new AbortController();
 	let started = 0;
 	const during = await runCase({
@@ -746,12 +747,12 @@ async function case9Abort(): Promise<void> {
 	check("9 abort: aborting while the workers run stops the run", during.result.stop === "aborted", during.result);
 	check(
 		"9 abort: the worktrees are removed and the real tree is still the base",
-		treeId(repoA) === baseA && worktreeCount(repoA) === 1 && candidateDirs(during.ledger).length === 0,
+		treeId(pinned(repoA)) === baseA && worktreeCount(repoA) === 1 && candidateDirs(during.ledger).length === 0,
 	);
 
 	const repoB = newRepo("c9b");
 	writeFileSync(join(repoB, "dirty.txt"), "untracked");
-	const baseB = treeId(repoB);
+	const baseB = treeId(pinned(repoB));
 	const abortB = new AbortController();
 	const marker = join(root, "c9b.gate-started");
 	const poll = setInterval(() => {
@@ -779,7 +780,7 @@ async function case9Abort(): Promise<void> {
 	check("9 abort: aborting during a candidate's gate stops the run", gating.result.stop === "aborted", gating.result);
 	check(
 		"9 abort: the applied patch is reverted, the worktrees are removed, the real tree is still the base",
-		treeId(repoB) === baseB &&
+		treeId(pinned(repoB)) === baseB &&
 			!existsSync(join(repoB, "cand1.txt")) &&
 			worktreeCount(repoB) === 1 &&
 			candidateDirs(gating.ledger).length === 0,
@@ -846,10 +847,11 @@ async function case10DirtyState(): Promise<void> {
 
 async function case11StaleWorktrees(): Promise<void> {
 	const repo = newRepo("c11");
-	const base = snapshotTree(repo);
+	const main = pinned(repo);
+	const base = snapshotTree(main);
 	const oldTurn = (turn: string) => join(stateDir, "old-sess", turn);
-	const stale = addCandidateWorktree(repo, oldTurn("turn-dead"), 1, 1, base);
-	const live = addCandidateWorktree(repo, oldTurn("turn-live"), 1, 1, base);
+	const stale = addCandidateWorktree(main, oldTurn("turn-dead"), 1, 1, base).workTree;
+	const live = addCandidateWorktree(main, oldTurn("turn-live"), 1, 1, base).workTree;
 	git(repo, "worktree", "unlock", stale);
 	git(repo, "worktree", "lock", "--reason", `ledgerpi:${await deadPid()}`, stale);
 
@@ -874,7 +876,7 @@ async function case11StaleWorktrees(): Promise<void> {
 
 	git(repo, "worktree", "unlock", live);
 	git(repo, "worktree", "lock", "--reason", `ledgerpi:${await deadPid()}`, live);
-	const pruned = pruneStaleCandidates(repo, stateDir);
+	const pruned = pruneStaleCandidates(main, stateDir);
 	check(
 		"11 prune: once its owner is dead, pruneStaleCandidates removes it too",
 		pruned.length === 1 && pruned[0] === live && !existsSync(live) && worktreeCount(repo) === 1,
@@ -1095,7 +1097,7 @@ async function case18AskAccept(): Promise<void> {
 		[brief, run.result.fanout],
 	);
 	check("18 ask accept: the summary counts one question", run.result.fanout?.asked === 1, run.result.fanout);
-	const handoff = handoffBlock(repo, run.result);
+	const handoff = handoffBlock(pinned(repo), run.result);
 	check("18 ask accept: the hand-off says Asked: 1.", handoff.includes(" Asked: 1."), handoff);
 	const auditLog = join(root, "c18.audit.jsonl");
 	auditRun({ ...run.cfg, auditLog }, { entry: "tool", session: "sess", cwd: repo }, run.result, {
@@ -1133,8 +1135,8 @@ async function case19AskDecline(): Promise<void> {
 	);
 	check(
 		"19 ask decline: the hand-off says Asked: 2. and lists the downgrade",
-		handoffBlock(repo, run.result).includes("Downgrades: declined. Asked: 2."),
-		handoffBlock(repo, run.result),
+		handoffBlock(pinned(repo), run.result).includes("Downgrades: declined. Asked: 2."),
+		handoffBlock(pinned(repo), run.result),
 	);
 	const single = scriptedConfirm(["no"]);
 	const serialAfterNo = await runCase({
@@ -1209,8 +1211,8 @@ async function case21AskNoUi(): Promise<void> {
 	check("21 ask no-ui: nothing was asked", run.result.fanout?.asked === 0, run.result.fanout);
 	check(
 		"21 ask no-ui: the hand-off says Asked: 0.",
-		handoffBlock(repo, run.result).includes("Downgrades: no-ui. Asked: 0."),
-		handoffBlock(repo, run.result),
+		handoffBlock(pinned(repo), run.result).includes("Downgrades: no-ui. Asked: 0."),
+		handoffBlock(pinned(repo), run.result),
 	);
 }
 
@@ -1553,6 +1555,94 @@ async function case29GateHookRejects(): Promise<void> {
 	);
 }
 
+/** Every path under `dir` with the contents of each file. */
+function dirContents(dir: string): [string, string][] {
+	return readdirSync(dir, { recursive: true, encoding: "utf8" })
+		.sort()
+		.map((name) => {
+			const path = join(dir, name);
+			return [name, statSync(path).isFile() ? readFileSync(path, "base64") : ""];
+		});
+}
+
+async function case30RepointedCandidate(): Promise<void> {
+	const repo = newRepo("c30");
+	const planted = newRepo("c30-planted");
+	const beyond = join(root, "c30-beyond");
+	const marker = join(root, "c30.marker");
+	mkdirSync(beyond);
+	writeFileSync(join(beyond, "secret.txt"), "outside content");
+	git(planted, "config", "core.worktree", beyond);
+	git(planted, "config", "core.fsmonitor", `touch '${marker}'; true`);
+	git(planted, "config", "filter.trap.clean", `touch '${marker}'; cat`);
+	const plantedGitDir = join(planted, ".git");
+	mkdirSync(join(plantedGitDir, "info"), { recursive: true });
+	writeFileSync(join(plantedGitDir, "info", "attributes"), "* filter=trap\n");
+	const plantedBefore = dirContents(plantedGitDir);
+	const redirect = `gitdir: ${plantedGitDir}\n`;
+	let redirected = "";
+	const run = await runCase({
+		name: "c30",
+		repo,
+		config: "on",
+		n: 2,
+		script: {
+			manage: (n) =>
+				n === 1 ? managerReply("continue", "make it pass", "best-of-n: uncertain") : managerReply("done", ""),
+			work: async (c) => {
+				if (candidateIndex(c) !== 1) {
+					writeFileSync(join(c.cwd, "cand2.txt"), "2");
+					return ok(WORKED);
+				}
+				await after(150, null);
+				writeFileSync(join(c.cwd, ".git"), redirect);
+				redirected = readFileSync(join(c.cwd, ".git"), "utf8");
+				writeFileSync(join(c.cwd, "seed"), "edited by the redirected candidate");
+				return passingWorker(c);
+			},
+		},
+	});
+	const attempts = run.rows.find((r) => r.role === "fanout")?.attempts as { outcome: string }[] | undefined;
+	check(
+		"30 repointed .git: the run finishes with a normal stop, keeping the redirected candidate after its sibling",
+		redirected === redirect &&
+			run.result.converged &&
+			run.result.stop === "done" &&
+			JSON.stringify(attempts?.map((a) => a.outcome)) === JSON.stringify(["kept", "gate-red"]),
+		[redirected, run.result, attempts],
+	);
+	check("30 repointed .git: nothing set in the planted git dir ran", !existsSync(marker));
+	const status = git(repo, "status", "--porcelain", "--untracked-files=all");
+	check(
+		"30 repointed .git: the patch carries the candidate's own edits into the real tree and nothing else",
+		status === "M seed\n?? pass.txt" &&
+			readFileSync(join(repo, "seed"), "utf8") === "edited by the redirected candidate",
+		status,
+	);
+	const listing = git(repo, "worktree", "list", "--porcelain");
+	const admins = join(repo, ".git", "worktrees");
+	check(
+		"30 repointed .git: both candidate worktrees and their metadata are removed",
+		worktreeCount(repo) === 1 &&
+			candidateDirs(run.ledger).length === 0 &&
+			!listing.includes(run.ledger.dir) &&
+			(!existsSync(admins) || readdirSync(admins).length === 0),
+		[listing, candidateDirs(run.ledger)],
+	);
+	check(
+		"30 repointed .git: the planted git dir is left as it was",
+		existsSync(plantedGitDir) && JSON.stringify(dirContents(plantedGitDir)) === JSON.stringify(plantedBefore),
+	);
+	const follower = join(root, "c30-follower");
+	mkdirSync(follower);
+	writeFileSync(join(follower, ".git"), redirect);
+	git(follower, "status");
+	check("30 repointed .git: plain git following that .git does run the planted fsmonitor", existsSync(marker));
+	rmSync(marker, { force: true });
+	git(follower, "-c", "core.fsmonitor=false", "add", "-A");
+	check("30 repointed .git: git following that .git does run the planted clean filter", existsSync(marker));
+}
+
 async function main(): Promise<void> {
 	mkdirSync(root, { recursive: true });
 	writeFileSync(configFile, `stateDir = "${stateDir}"\nproviders = ["test"]\n`);
@@ -1587,6 +1677,7 @@ async function main(): Promise<void> {
 	await case27PlanRetry();
 	await case28GateHook();
 	await case29GateHookRejects();
+	await case30RepointedCandidate();
 
 	rmSync(root, { recursive: true, force: true });
 	console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);

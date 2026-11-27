@@ -1,5 +1,5 @@
 import { gateCommandText } from "./gate.ts";
-import { diffStat } from "./git.ts";
+import { diffStat, type RepoPin } from "./git.ts";
 import type { FanoutSummary, LoopResult } from "./loop.ts";
 import { renderTasks } from "./parse.ts";
 
@@ -23,8 +23,8 @@ function fanoutLine(f: FanoutSummary): string {
  * so and carries the notes and the remaining tasks, so the main model continues
  * from where the loop left off rather than starting over.
  */
-export function handoffBlock(cwd: string, result: LoopResult): string {
-	const stat = diffStat(cwd);
+export function handoffBlock(repo: RepoPin, result: LoopResult): string {
+	const stat = diffStat(repo);
 	const command = result.gate?.command ?? "";
 	const multiLine = command.includes("\n");
 	const verdict = result.gate?.ran ? (result.gate.passed ? "passed" : "FAILED") : "not run";

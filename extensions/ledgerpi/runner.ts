@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { EventBus, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { asFanoutSetting, type LedgerpiConfig } from "../../packages/core/src/config.ts";
+import type { RepoPin } from "../../packages/core/src/git.ts";
 import { Ledger } from "../../packages/core/src/ledger.ts";
 import { type LoopDeps, type LoopResult, runLoop } from "../../packages/core/src/loop.ts";
 import { report } from "../../packages/core/src/report.ts";
@@ -203,7 +204,8 @@ export function fanoutAsker(
  * Build a fresh ledger for this turn and run the manager-worker loop against it.
  * `cwd` is passed explicitly rather than read from `ctx`: the input hook uses the
  * session cwd, but the `ledger_solve` tool may target a carved worktree whose path
- * is not the session cwd. `signal` is likewise explicit: pi's `ctx.signal` exists
+ * is not the session cwd. `repo` is the pin of the repository holding `cwd`, taken by
+ * the caller's git check. `signal` is likewise explicit: pi's `ctx.signal` exists
  * only while the agent streams, so the idle-started entry points supply their own.
  * `models` holds the caller's snapshot, taken before its awaits, of the session's
  * `provider/modelId` (`session`) and its `roleModelsFor` result (`manager` and
@@ -219,6 +221,7 @@ export function runLedger(
 	cfg: LedgerpiConfig,
 	ctx: ExtensionContext,
 	cwd: string,
+	repo: RepoPin,
 	task: string,
 	gateCommand: string | undefined,
 	models: { session: string | null; manager: string | null; worker: string | null },
@@ -234,6 +237,7 @@ export function runLedger(
 		cfg,
 		ledger,
 		cwd,
+		repo,
 		task,
 		gateCommand,
 		sessionModel: models.session,

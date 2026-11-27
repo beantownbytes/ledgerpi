@@ -1,7 +1,7 @@
 import { type FanoutSetting, type LedgerpiConfig, lowerFanout } from "./config.ts";
 import { type Candidate, chooseMode, type FanoutAnswer, type RoundMode, runBestOfN } from "./fanout.ts";
 import { type GateRunner, type GateVerdict, runGate } from "./gate.ts";
-import { pruneStaleCandidates, workingDiff } from "./git.ts";
+import { pruneStaleCandidates, type RepoPin, workingDiff } from "./git.ts";
 import type { Ledger } from "./ledger.ts";
 import {
 	briefFor,
@@ -138,6 +138,8 @@ export interface LoopDeps {
 	cfg: LedgerpiConfig;
 	ledger: Ledger;
 	cwd: string;
+	/** The pinned repository holding `cwd`, which every git step of the run goes through. */
+	repo: RepoPin;
 	task: string;
 	/** The detected gate command, or undefined to run without a verifier. */
 	gateCommand?: string;
@@ -228,8 +230,20 @@ async function runRounds(
 	fan: FanoutSummary | null,
 	timing: RoleTiming,
 ): Promise<RoundsResult> {
-	const { spawn, cfg, ledger, cwd, task, gateCommand, sessionModel, managerModel, workerModel, onProgress, signal } =
-		deps;
+	const {
+		spawn,
+		cfg,
+		ledger,
+		cwd,
+		repo,
+		task,
+		gateCommand,
+		sessionModel,
+		managerModel,
+		workerModel,
+		onProgress,
+		signal,
+	} = deps;
 	let calls = 0;
 	let tokens = 0;
 
@@ -330,7 +344,7 @@ async function runRounds(
 		return { verdict };
 	};
 
-	if (fanout !== "off") pruneStaleCandidates(cwd, cfg.stateDir);
+	if (fanout !== "off") pruneStaleCandidates(repo, cfg.stateDir);
 	ledger.setTask(task);
 
 	let tasks: Task[] = [];
@@ -377,7 +391,19 @@ async function runRounds(
 
 	// 3. First manage pass off the ideation or the supplied plan.
 	let gate: GateVerdict | null = null;
-	let manage = await manageOnce(call, cfg, ledger, cwd, task, tasks, firstResult, gate, gateCommand, "manage", fanout);
+	let manage = await manageOnce(
+		call,
+		cfg,
+		ledger,
+		repo,
+		task,
+		tasks,
+		firstResult,
+		gate,
+		gateCommand,
+		"manage",
+		fanout,
+	);
 	if (signal?.aborted) return abort(calls, tokens);
 	tasks = manage.tasks;
 	ledger.setTasksJson(tasks);
@@ -468,7 +494,7 @@ async function runRounds(
 			task,
 			plan: ledger.plan(),
 			notes: ledger.notes(),
-			diff: workingDiff(cwd),
+			diff: workingDiff(repo),
 			brief: manage.brief,
 			gateHint: gateCommand,
 		};
@@ -488,13 +514,14 @@ async function runRounds(
 			};
 			const outcome = await runBestOfN({
 				cwd,
+				repo,
 				ledgerDir: ledger.dir,
 				iter: iters,
 				n,
 				runWorker: (c: Candidate, childSignal) =>
 					call(
 						WORKER,
-						workerPrompt({ ...workerArgs, worktree: c.worktree }),
+						workerPrompt({ ...workerArgs, worktree: c.repo.workTree }),
 						cfg.workerThinking,
 						WORKER_TURNS,
 						"work",
@@ -582,7 +609,7 @@ async function runRounds(
 			call,
 			cfg,
 			ledger,
-			cwd,
+			repo,
 			task,
 			tasks,
 			workerSummary,
@@ -610,7 +637,7 @@ async function runRounds(
 			task,
 			plan: ledger.plan(),
 			notes: ledger.notes(),
-			diff: workingDiff(cwd),
+			diff: workingDiff(repo),
 			gateHint: gateCommand,
 		}),
 		cfg.workerThinking,
@@ -683,7 +710,7 @@ async function manageOnce(
 	call: CallFn,
 	cfg: LedgerpiConfig,
 	ledger: Ledger,
-	cwd: string,
+	repo: RepoPin,
 	task: string,
 	tasks: Task[],
 	lastResult: string,
@@ -698,7 +725,7 @@ async function manageOnce(
 			task,
 			plan: ledger.plan(),
 			notes: ledger.notes(),
-			diff: workingDiff(cwd),
+			diff: workingDiff(repo),
 			tasks,
 			lastResult,
 			gate,

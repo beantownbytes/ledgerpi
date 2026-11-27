@@ -5,20 +5,48 @@ import {
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	readlinkSync,
 	realpathSync,
 	rmSync,
+	statSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isAlive } from "./proc.ts";
 
-/** Runs a git command in cwd and returns stdout, or "" on any failure. Read-only callers only. */
-function git(cwd: string, args: string[]): string {
+/** Where one work tree's git data lives, resolved once so no later call follows a `.git` file. */
+export interface RepoPin {
+	readonly workTree: string;
+	readonly gitDir: string;
+	readonly commonDir: string;
+}
+
+/** A directory git discovers the repository from (discovery calls only), or a pinned repository. */
+type GitLocation = string | RepoPin;
+
+/** Overrides on every git call that keep commands set in repository config from running; filters are not covered. */
+const HARDENING = [
+	"core.fsmonitor=false",
+	"core.hooksPath=/dev/null",
+	"hook.post-index-change.enabled=false",
+	"hook.post-checkout.enabled=false",
+	"hook.reference-transaction.enabled=false",
+].flatMap((setting) => ["-c", setting]);
+
+/** The working directory and full argument list of a git call at `at`. */
+function invocation(at: GitLocation, args: string[]): { cwd: string; argv: string[] } {
+	if (typeof at === "string") return { cwd: at, argv: [...HARDENING, ...args] };
+	return { cwd: at.workTree, argv: ["--git-dir", at.gitDir, "--work-tree", at.workTree, ...HARDENING, ...args] };
+}
+
+/** Runs a git command at `at` and returns stdout, or "" on any failure. Read-only callers only. */
+function git(at: GitLocation, args: string[]): string {
 	try {
-		return execFileSync("git", args, {
+		const { cwd, argv } = invocation(at, args);
+		return execFileSync("git", argv, {
 			cwd,
 			encoding: "utf8",
 			maxBuffer: 8 * 1024 * 1024,
@@ -58,9 +86,9 @@ function redactRemote(url: string): string {
 	return url.replace(/^(https?:\/\/)[^/?#]*@/i, "$1");
 }
 
-/** Read origin, branch, and HEAD for cwd. Never throws: any git failure is a null field. */
-export function headInfo(cwd: string): HeadInfo {
-	const read = (args: string[]) => git(cwd, args).trim() || null;
+/** Read origin, branch, and HEAD of `repo`. Never throws: any git failure is a null field. */
+export function headInfo(repo: RepoPin): HeadInfo {
+	const read = (args: string[]) => git(repo, args).trim() || null;
 	const repoUrl = read(["remote", "get-url", "origin"]);
 	return {
 		repoUrl: repoUrl === null ? null : redactRemote(repoUrl),
@@ -128,33 +156,37 @@ export function isInWorkTree(cwd: string, path: string): boolean {
 
 const DIFF_MAX_CHARS = 12_000;
 
+/** Keeps a diff from running a configured diff command or textconv driver, or starting git inside a submodule. */
+const DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--submodule=short"];
+
 /**
  * The current working-tree diff (tracked changes plus untracked file names),
  * capped so a large change cannot blow out the manager/worker prompt. The
  * workers can always read a file in full themselves; this is orientation.
  */
-export function workingDiff(cwd: string): string {
-	const tracked = git(cwd, ["diff", "--no-color"]);
-	const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard"]).trim();
+export function workingDiff(repo: RepoPin): string {
+	const tracked = git(repo, ["diff", "--no-color", ...DIFF_FLAGS]);
+	const untracked = git(repo, ["ls-files", "--others", "--exclude-standard"]).trim();
 	let out = tracked;
 	if (untracked) out += `\n\nUntracked files:\n${untracked}`;
 	return out.length > DIFF_MAX_CHARS ? `${out.slice(0, DIFF_MAX_CHARS)}\n[diff truncated]` : out;
 }
 
 /** `git diff --stat` for the hand-off summary. */
-export function diffStat(cwd: string): string {
-	return git(cwd, ["diff", "--stat"]).trim();
+export function diffStat(repo: RepoPin): string {
+	return git(repo, ["diff", "--stat", ...DIFF_FLAGS]).trim();
 }
 
 const WRITE_MAX_BUFFER = 256 * 1024 * 1024;
 
 /**
- * Runs a git command in cwd and returns raw stdout. Unlike the read-only `git()`,
+ * Runs a git command at `at` and returns raw stdout. Unlike the read-only `git()`,
  * a failure throws an Error naming the command and git's stderr.
  */
-function gitRun(cwd: string, args: string[], opts: { env?: Record<string, string>; input?: Buffer } = {}): Buffer {
+function gitRun(at: GitLocation, args: string[], opts: { env?: Record<string, string>; input?: Buffer } = {}): Buffer {
 	try {
-		return execFileSync("git", args, {
+		const { cwd, argv } = invocation(at, args);
+		return execFileSync("git", argv, {
 			cwd,
 			maxBuffer: WRITE_MAX_BUFFER,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -168,15 +200,25 @@ function gitRun(cwd: string, args: string[], opts: { env?: Record<string, string
 }
 
 /** `gitRun` as trimmed UTF-8 text. */
-function gitLine(cwd: string, args: string[], opts: { env?: Record<string, string>; input?: Buffer } = {}): string {
-	return gitRun(cwd, args, opts).toString("utf8").trim();
+function gitLine(at: GitLocation, args: string[], opts: { env?: Record<string, string>; input?: Buffer } = {}): string {
+	return gitRun(at, args, opts).toString("utf8").trim();
 }
 
-/** The work tree root holding cwd; throws outside a work tree. */
-function requireRoot(cwd: string): string {
-	const root = workTreeRoot(cwd);
-	if (root === null) throw new Error(`${cwd} is not inside a git work tree`);
-	return root;
+/**
+ * Pin the repository of the work tree holding `cwd`.
+ *
+ * @returns the pin, or null when cwd is not inside a work tree git will operate on.
+ */
+export function pinRepo(cwd: string): RepoPin | null {
+	try {
+		const out = gitRun(cwd, ["rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"]);
+		const lines = out.toString("utf8").replace(/\n$/, "").split("\n");
+		const [workTree, gitDir, commonDir] = lines;
+		if (lines.length !== 3 || !workTree || !gitDir || !commonDir) return null;
+		return { workTree, gitDir, commonDir: resolve(realpathSync(cwd), commonDir) };
+	} catch {
+		return null;
+	}
 }
 
 const SNAPSHOT_IDENTITY = {
@@ -187,52 +229,104 @@ const SNAPSHOT_IDENTITY = {
 };
 
 /**
- * The tree object id of cwd's whole working state (tracked, staged, unstaged, and
+ * The git dir of the repository checked out at `path`, relative to the work tree of `repo`,
+ * or null when `path` is not a real directory inside that work tree holding one.
+ */
+function submoduleGitDir(repo: RepoPin, path: string): string | null {
+	const dir = join(repo.workTree, path);
+	try {
+		if (realpathSync(dir) !== join(realpathSync(repo.workTree), path) || !statSync(dir).isDirectory()) return null;
+	} catch {
+		return null;
+	}
+	return git(repo.workTree, ["rev-parse", "--resolve-git-dir", join(dir, ".git")]).replace(/\n$/, "") || null;
+}
+
+/**
+ * Mark each checked-out submodule skip-worktree in the index named by `env`, so that `git add`
+ * starts no git process inside it, after recording its HEAD there. A submodule with no commit
+ * checked out keeps the entry the index already has.
+ *
+ * @returns the marked paths.
+ * @throws when a submodule path is not valid UTF-8, or an unmerged submodule has no commit checked out.
+ */
+function recordSubmodules(repo: RepoPin, env: Record<string, string>): string[] {
+	const entries = gitRun(repo, ["ls-files", "-s", "-z"], { env }).toString("latin1").split("\0");
+	const gitlinks = new Set(
+		entries.filter((entry) => entry.startsWith("160000 ")).map((entry) => entry.slice(entry.indexOf("\t") + 1)),
+	);
+	const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+	const marked: string[] = [];
+	for (const listed of gitlinks) {
+		const bytes = Buffer.from(listed, "latin1");
+		let path: string;
+		try {
+			path = utf8.decode(bytes);
+		} catch {
+			throw new Error(`submodule path is not valid UTF-8: ${bytes.toString("utf8")}`);
+		}
+		const gitDir = submoduleGitDir(repo, path);
+		if (gitDir === null) continue;
+		const sha = git(repo.workTree, [`--git-dir=${gitDir}`, "rev-parse", "--verify", "-q", "HEAD"]).trim();
+		if (sha) gitRun(repo, ["update-index", "--add", "--cacheinfo", `160000,${sha},${path}`], { env });
+		marked.push(path);
+	}
+	if (marked.length > 0) {
+		const input = Buffer.from(marked.map((path) => `${path}\0`).join(""));
+		gitRun(repo, ["update-index", "--skip-worktree", "-z", "--stdin"], { env, input });
+	}
+	return marked;
+}
+
+/**
+ * The tree object id of the whole working state of `repo` (tracked, staged, unstaged, and
  * untracked-but-not-ignored files), built in a throwaway copy of the index so the
  * real index is never touched.
  */
-function workingTree(cwd: string, trackedOnly = false): string {
-	const root = requireRoot(cwd);
+function workingTree(repo: RepoPin, trackedOnly = false): string {
 	const scratch = mkdtempSync(join(tmpdir(), "ledgerpi-index-"));
 	try {
 		const indexFile = join(scratch, "index");
-		const realIndex = resolve(root, gitLine(root, ["rev-parse", "--git-path", "index"]));
+		const realIndex = resolve(repo.workTree, gitLine(repo, ["rev-parse", "--git-path", "index"]));
 		if (existsSync(realIndex)) copyFileSync(realIndex, indexFile);
 		const env = { GIT_INDEX_FILE: indexFile };
-		gitRun(root, ["add", trackedOnly ? "-u" : "-A"], { env });
-		return gitLine(root, ["write-tree"], { env });
+		// A sparse checkout otherwise drops skip-worktree from every path present on disk. The index
+		// writes in recordSubmodules have already saved that drop for all other paths.
+		const keepSkipped =
+			recordSubmodules(repo, env).length > 0 ? ["-c", "sparse.expectFilesOutsideOfPatterns=true"] : [];
+		gitRun(repo, [...keepSkipped, "add", trackedOnly ? "-u" : "-A"], { env });
+		return gitLine(repo, ["write-tree"], { env });
 	} finally {
 		rmSync(scratch, { recursive: true, force: true });
 	}
 }
 
 /**
- * The tree id of cwd's working state, or of `commit` when given. Two equal ids mean
+ * The tree id of the working state of `repo`, or of `commit` when given. Two equal ids mean
  * identical file contents and modes.
  */
-export function treeId(cwd: string, commit?: string): string {
-	if (commit !== undefined) return gitLine(cwd, ["rev-parse", "--verify", `${commit}^{tree}`]);
-	return workingTree(cwd);
+export function treeId(repo: RepoPin, commit?: string): string {
+	if (commit !== undefined) return gitLine(repo, ["rev-parse", "--verify", `${commit}^{tree}`]);
+	return workingTree(repo);
 }
 
 /**
- * The tree id of cwd's tracked files only, as they are on disk. Unlike `treeId`, files a
+ * The tree id of the tracked files only of `repo`, as they are on disk. Unlike `treeId`, files a
  * process creates without git knowing them (build output, caches) do not change it.
  */
-export function trackedTreeId(cwd: string): string {
-	return workingTree(cwd, true);
+export function trackedTreeId(repo: RepoPin): string {
+	return workingTree(repo, true);
 }
 
 /**
- * Commit the working state of cwd (staged, unstaged, and untracked files alike) as a
+ * Commit the working state of `repo` (staged, unstaged, and untracked files alike) as a
  * dangling commit on top of HEAD, and return its id. No ref, index, or file changes.
  */
-export function snapshotTree(cwd: string): string {
-	const tree = workingTree(cwd);
-	const root = requireRoot(cwd);
-	const head = git(root, ["rev-parse", "--verify", "-q", "HEAD"]).trim();
+export function snapshotTree(repo: RepoPin): string {
+	const tree = workingTree(repo);
+	const head = git(repo, ["rev-parse", "--verify", "-q", "HEAD"]).trim();
 	const parent = head ? ["-p", head] : [];
-	return gitLine(root, ["-c", "commit.gpgsign=false", "commit-tree", tree, ...parent, "-m", "ledgerpi snapshot"], {
+	return gitLine(repo, ["-c", "commit.gpgsign=false", "commit-tree", tree, ...parent, "-m", "ledgerpi snapshot"], {
 		env: SNAPSHOT_IDENTITY,
 	});
 }
@@ -243,81 +337,94 @@ export function candidatePath(ledgerDir: string, iter: number, index: number): s
 }
 
 /**
- * Create a detached worktree of cwd's repository at `commit`, locked with reason
- * `ledgerpi:<pid>` so a later run can tell a dead owner from a live one. Returns the
- * worktree path, `<ledgerDir>/candidates/<iter>-<index>`.
+ * The administrative directory under the common git dir whose `gitdir` file names the
+ * worktree at `path`, or null when there is none. The worktree's own `.git` is not read.
  */
-export function addCandidateWorktree(
-	cwd: string,
-	ledgerDir: string,
-	iter: number,
-	index: number,
-	commit: string,
-): string {
-	const path = candidatePath(ledgerDir, iter, index);
-	mkdirSync(dirname(path), { recursive: true });
-	gitRun(
-		requireRoot(cwd),
-		[
-			"-c",
-			"core.hooksPath=/dev/null",
-			"worktree",
-			"add",
-			"--detach",
-			"--lock",
-			"--reason",
-			`ledgerpi:${process.pid}`,
-			path,
-			commit,
-		],
-		{ env: { GIT_LFS_SKIP_SMUDGE: "1" } },
-	);
-	return path;
-}
-
-/** The administrative directory git keeps for the linked worktree at `path`, or null when it cannot be read. */
-function worktreeAdminDir(path: string): string | null {
+function worktreeAdminDir(repo: RepoPin, path: string): string | null {
+	let parent = dirname(path);
 	try {
-		const pointer = readFileSync(join(path, ".git"), "utf8").match(/^gitdir: (.+)$/m)?.[1];
-		return pointer === undefined ? null : resolve(path, pointer.trim());
+		parent = realpathSync(parent);
+	} catch {}
+	const link = resolve(parent, basename(path), ".git");
+	const admins = join(repo.commonDir, "worktrees");
+	let ids: string[];
+	try {
+		ids = readdirSync(admins);
 	} catch {
 		return null;
+	}
+	for (const id of ids) {
+		const admin = join(admins, id);
+		try {
+			const recorded = readFileSync(join(admin, "gitdir"), "utf8").replace(/\r?\n$/, "");
+			if (resolve(realpathSync(admin), recorded) === link) return admin;
+		} catch {}
+	}
+	return null;
+}
+
+/** Best-effort removal of a linked worktree, its directory and its administrative directory. Never throws. */
+function discardWorktree(repo: RepoPin, workTree: string, adminDir: string | null): void {
+	const attempt = (step: () => void) => {
+		try {
+			step();
+		} catch {}
+	};
+	attempt(() => gitRun(repo, ["worktree", "unlock", workTree]));
+	attempt(() => gitRun(repo, ["worktree", "remove", "--force", workTree]));
+	attempt(() => rmSync(workTree, { recursive: true, force: true }));
+	if (adminDir !== null && dirname(adminDir) === join(repo.commonDir, "worktrees")) {
+		attempt(() => rmSync(adminDir, { recursive: true, force: true }));
 	}
 }
 
 /**
- * Remove a candidate worktree and its metadata, locked or not. Never throws: cleanup
- * must not mask the error that sent the caller here.
+ * Create a detached worktree of `repo` at `commit`, under
+ * `<ledgerDir>/candidates/<iter>-<index>`, locked with reason `ledgerpi:<pid>` so a
+ * later run can tell a dead owner from a live one.
+ *
+ * @returns the new worktree's pin.
+ * @throws when the worktree cannot be created or pinned; what this call created is removed first.
  */
-export function removeCandidateWorktree(cwd: string, path: string): void {
-	const root = workTreeRoot(cwd) ?? cwd;
-	const attempt = (args: string[]) => {
-		try {
-			gitRun(root, args);
-		} catch {}
-	};
-	const remove = (target: string) => {
-		try {
-			rmSync(target, { recursive: true, force: true });
-		} catch {}
-	};
-	const admin = worktreeAdminDir(path);
-	attempt(["worktree", "unlock", path]);
-	attempt(["worktree", "remove", "--force", path]);
-	remove(path);
-	if (admin !== null && basename(dirname(admin)) === "worktrees") remove(admin);
+export function addCandidateWorktree(
+	repo: RepoPin,
+	ledgerDir: string,
+	iter: number,
+	index: number,
+	commit: string,
+): RepoPin {
+	const path = candidatePath(ledgerDir, iter, index);
+	mkdirSync(dirname(path), { recursive: true });
+	const taken = existsSync(path) || worktreeAdminDir(repo, path) !== null;
+	try {
+		gitRun(repo, ["worktree", "add", "--detach", "--lock", "--reason", `ledgerpi:${process.pid}`, path, commit], {
+			env: { GIT_LFS_SKIP_SMUDGE: "1" },
+		});
+		const gitDir = worktreeAdminDir(repo, path);
+		if (gitDir === null) throw new Error(`no worktree metadata for ${path} under ${repo.commonDir}`);
+		return { workTree: path, gitDir, commonDir: repo.commonDir };
+	} catch (err) {
+		if (!taken) discardWorktree(repo, path, worktreeAdminDir(repo, path));
+		throw err;
+	}
 }
 
 /**
- * Remove the stale candidate worktrees of cwd's repository that live under `stateDir`,
+ * Remove a candidate worktree of `repo` and its metadata, locked or not. Never throws:
+ * cleanup must not mask the error that sent the caller here.
+ */
+export function removeCandidateWorktree(repo: RepoPin, candidate: RepoPin): void {
+	discardWorktree(repo, candidate.workTree, candidate.gitDir);
+}
+
+/**
+ * Remove the stale candidate worktrees of `repo` that live under `stateDir`,
  * in any `<session>/<turn>/candidates/` directory: a crashed run's leftovers sit under
  * a ledger directory no later run reuses. A worktree is stale when its lock reason names
- * a dead `ledgerpi:<pid>`; one held by a live process, an unlocked one, and a worktree
- * elsewhere are left alone. Returns the removed paths.
+ * a dead `ledgerpi:<pid>`; one held by a live process, an unlocked one, one with no
+ * administrative directory, and a worktree elsewhere are left alone. Returns the removed paths.
  */
-export function pruneStaleCandidates(cwd: string, stateDir: string): string[] {
-	const root = workTreeRoot(cwd);
-	if (root === null) return [];
+export function pruneStaleCandidates(repo: RepoPin, stateDir: string): string[] {
 	let base: string;
 	try {
 		base = realpathSync(stateDir) + sep;
@@ -325,12 +432,14 @@ export function pruneStaleCandidates(cwd: string, stateDir: string): string[] {
 		return [];
 	}
 	const removed: string[] = [];
-	for (const entry of git(root, ["worktree", "list", "--porcelain"]).split("\n\n")) {
+	for (const entry of git(repo, ["worktree", "list", "--porcelain"]).split("\n\n")) {
 		const path = entry.match(/^worktree (.+)$/m)?.[1];
 		const pid = entry.match(/^locked ledgerpi:(\d+)$/m)?.[1];
 		if (path === undefined || pid === undefined || isAlive(Number(pid))) continue;
 		if (!path.startsWith(base) || basename(dirname(path)) !== "candidates") continue;
-		removeCandidateWorktree(root, path);
+		const gitDir = worktreeAdminDir(repo, path);
+		if (gitDir === null) continue;
+		removeCandidateWorktree(repo, { workTree: path, gitDir, commonDir: repo.commonDir });
 		removed.push(path);
 	}
 	return removed;
@@ -340,30 +449,29 @@ export function pruneStaleCandidates(cwd: string, stateDir: string): string[] {
  * The changes a candidate worktree made since `base` (a snapshot commit), as a binary
  * patch applicable at the root of the tree `base` was taken from. Empty when nothing changed.
  */
-export function candidatePatch(worktree: string, base: string): Buffer {
-	const candidate = snapshotTree(worktree);
-	return gitRun(requireRoot(worktree), [
+export function candidatePatch(candidate: RepoPin, base: string): Buffer {
+	const snapshot = snapshotTree(candidate);
+	return gitRun(candidate, [
 		"diff",
 		"--binary",
 		"--full-index",
 		"--no-color",
-		"--no-ext-diff",
-		"--no-textconv",
+		...DIFF_FLAGS,
 		"--src-prefix=a/",
 		"--dst-prefix=b/",
 		base,
-		candidate,
+		snapshot,
 	]);
 }
 
-/** Apply `patch` to the work tree of cwd, all or nothing; throws, changing nothing, when it does not apply. An empty patch is a no-op. */
-export function applyPatch(cwd: string, patch: Buffer): void {
+/** Apply `patch` to the work tree of `repo`, all or nothing; throws, changing nothing, when it does not apply. An empty patch is a no-op. */
+export function applyPatch(repo: RepoPin, patch: Buffer): void {
 	if (patch.length === 0) return;
-	gitRun(requireRoot(cwd), ["apply", "--binary", "--whitespace=nowarn"], { input: patch });
+	gitRun(repo, ["apply", "--binary", "--whitespace=nowarn"], { input: patch });
 }
 
-/** Undo `applyPatch(cwd, patch)`, all or nothing; throws, changing nothing, when the tree no longer matches. */
-export function revertPatch(cwd: string, patch: Buffer): void {
+/** Undo `applyPatch(repo, patch)`, all or nothing; throws, changing nothing, when the tree no longer matches. */
+export function revertPatch(repo: RepoPin, patch: Buffer): void {
 	if (patch.length === 0) return;
-	gitRun(requireRoot(cwd), ["apply", "-R", "--binary", "--whitespace=nowarn"], { input: patch });
+	gitRun(repo, ["apply", "-R", "--binary", "--whitespace=nowarn"], { input: patch });
 }
