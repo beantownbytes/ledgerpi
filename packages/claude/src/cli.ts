@@ -56,11 +56,17 @@ function shellQuote(path: string): string {
 	return `'${path.replaceAll("'", "'\\''")}'`;
 }
 
-/** The refusal for a work tree another loop holds. It does not invite the caller to edit beside that loop. */
-function refuseLocked(root: string): number {
+/**
+ * The refusal for a work tree another loop holds. It does not invite the caller to edit
+ * beside that loop, and offers `ledgerctl stop` only when the holder may be signaled.
+ */
+function refuseLocked(root: string, holder: LockHolder | null): number {
 	const quoted = shellQuote(root);
+	const wait = `Another ledger loop is editing \`${root}\`. Wait for it to finish, \`ledgerctl status --json --cwd ${quoted}\` reports it under \`lock\``;
 	return refuse(
-		`Another ledger loop is editing \`${root}\`. Wait for it to finish, \`ledgerctl status --json --cwd ${quoted}\` reports it under \`lock\`, or run \`ledgerctl stop --cwd ${quoted}\`, and leave this tree alone until then.`,
+		holder?.shared
+			? `${wait}, and leave this tree alone until then. It runs inside a host process that ledgerctl does not signal; cancel it in the session that started it.`
+			: `${wait}, or run \`ledgerctl stop --cwd ${quoted}\`, and leave this tree alone until then.`,
 	);
 }
 
@@ -70,7 +76,7 @@ function deliver(outcome: SolveOutcome): number {
 		case "rejected":
 			return punt(outcome.message);
 		case "busy":
-			return refuseLocked(outcome.root);
+			return refuseLocked(outcome.root, outcome.holder);
 		case "canceled":
 			emitLine({ type: "done", handoff: ABORTED_HANDOFF });
 			return 0;
@@ -101,7 +107,7 @@ function lockReport(cfg: LedgerpiConfig, cwd: string): ReturnType<typeof lockedT
 function lockLine(lock: ReturnType<typeof lockReport>): string {
 	if (lock === null) return "lock: free";
 	if ("error" in lock) return `lock: unreadable (${lock.error})`;
-	return `lock: held by pid ${lock.pid} (${lock.root})`;
+	return `lock: held by pid ${lock.pid}${lock.shared ? ", a shared host process" : ""} (${lock.root})`;
 }
 
 async function solve(cfg: LedgerpiConfig, args: SolveArgs): Promise<number> {
@@ -190,6 +196,12 @@ function stop(cfg: LedgerpiConfig, cwd: string): number {
 	if (holder === null) {
 		console.log("ledgerpi: no ledger loop is running in this repository.");
 		return 0;
+	}
+	if (holder.shared) {
+		console.log(
+			`ledgerpi: the loop in this repository runs inside a host process (pid ${holder.pid}) that is not signaled from here. Cancel it in the session that started it.`,
+		);
+		return 1;
 	}
 	process.kill(holder.pid, "SIGTERM");
 	console.log("ledgerpi: stopping the ledger loop.");

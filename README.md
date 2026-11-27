@@ -1,7 +1,7 @@
 # ledgerpi
 
-Ledger-based manager-worker coding for [pi](https://pi.dev) and
-[Claude Code](#claude-code). ledgerpi runs the
+Ledger-based manager-worker coding for [pi](https://pi.dev),
+[Claude Code](#claude-code), and [dsh](#dsh). ledgerpi runs the
 zero-shot self-orchestration scaffold from
 [arXiv 2608.26480](https://arxiv.org/abs/2608.26480) invisibly under the session
 on a local model: a manager plans, fresh-context workers each take one task, and
@@ -329,7 +329,7 @@ valid `### MODE` is recorded as no recommendation.
   manager recommends as `serial` or `fleet`, or that has no gate, never asks. The
   round runs serially, with a recorded reason, when it is not confirmed:
   `declined` (the user said no, by choice, Esc, or a remembered no), `no-ui`
-  (there is no way to ask: headless pi, `ledger_solve` without a UI, `ledgerctl`
+  (there is no way to ask: headless pi, `ledger_solve` without a UI, dsh, `ledgerctl`
   and so Claude Code, which has no dialog yet; `ask` there behaves like `advise`
   and never blocks), or `ask-failed` (the dialog could not be shown; this is not
   remembered, so the next best-of-N round asks again). A `latched` run stays
@@ -443,8 +443,9 @@ as recorded in the source named in each row, and a re-run can differ.
   models as `provider/modelId`, where each provider id is a key of `providers` in pi's
   `models.json`. See [Configure](#configure).
 
-`packages/core`, the Claude Code adapter (native sub-agents), the concurrency bench
-(plain HTTP) and the test suite (a stub bus) do not need pi-subagents.
+`packages/core`, the Claude Code adapter (native sub-agents), the dsh adapter (dsh
+subagents), the concurrency bench (plain HTTP) and the test suite (a stub bus) do not
+need pi-subagents.
 
 pi loads the extension's TypeScript directly via jiti; there is no build step.
 The extension has one runtime dependency (`smol-toml`), so when you load it from a
@@ -499,7 +500,8 @@ owns the ledger, the gate, a per-work-tree lock under `<stateDir>/locks/`, and t
 row. The lock is per work tree, so `ledgerctl stop --cwd <dir>` ends the loop on that tree
 and `ledgerctl status --json --cwd <dir>` reports it under `lock`, as `null` when free,
 `{ root, pid }` when held, or `{ error }` when the lock cannot be read; Escape in the session
-ends the loop too.
+ends the loop too. A lock a dsh run holds also has `shared: true`, and `stop` leaves that
+process alone and exits 1.
 
 `ledgerctl solve --plan-file <path>` is what the mod passes when `ledger_solve` gets
 `plan_file`. It has the same effect: the loop skips its planning and ideation steps and the
@@ -531,13 +533,217 @@ What to expect from the sub-agents:
 - **Turn limits.** A worker that hits `maxTurns` keeps its edits and the gate decides. A
   worker that backgrounds a command is stopped when its turn ends.
 
+## dsh
+
+The same loop, ledger, gate, and audit log run under dsh (DeepSeek Harness), as a bundle
+that offers a `ledger_solve` tool to agent presets and a `ledgerpi` service to other
+plugins. The manager and workers are dsh subagents. It is explicit only: there is no
+classifier, no auto-trigger, and no edit redirect. For how a run works, see
+[What it does](#what-it-does), [The host owns the ledger](#the-host-owns-the-ledger),
+[Fan-out](#fan-out), and [State](#state).
+
+### Install on dsh
+
+The bundle is written for dsh `0.2.3-alpha.2`, the `engines.dsh` version in
+`packages/dsh/package.json`. Build it and pass its patch to dsh, where `<checkout>` is the
+absolute path of your clone:
+
+```bash
+make bootstrap build    # needs npm and bun; writes packages/dsh/dist
+dsh --profile web --patch <checkout>/packages/dsh/dist/cordis.patch.yml
+```
+
+The build output is not committed, so rebuild after updating the checkout. The patch adds
+the `ledgerpi` root plugin and two agent presets, `ledger-manager` and `ledger-worker`,
+whose personas are built from `extensions/ledgerpi/agents/`.
+
+The patch does not give any agent the tool. Add this row to the `plugins` of each of your
+agent presets that should offer `ledger_solve`:
+
+```yaml
+- id: ledgerpi-tool
+  name: file://<checkout>/packages/dsh/dist/tool.js
+```
+
+Name it by `file://` URL, or by package name (`ledgerpi-dsh/tool`) where the package is
+installed so that dsh can resolve it. A plain path does not work there: dsh converts plain
+paths only in `insert` rows, not in a preset's `plugins`.
+
+Only profiles with an agent preset registry, such as `web`, are supported. Stock headless
+has none: with a `[dsh]` table the service there is inactive, with reason
+`no-preset-registry`, and runs nothing.
+
+### Configure dsh
+
+A `[dsh]` table, even an empty one, is the opt-in. It needs no `providers` entry. While
+the service is inactive (no `[dsh]` table, `enabled = false`, `LEDGERPI=0`, or no preset
+registry) the tool is hidden. The config is read on every call.
+
+```toml
+enabled = true
+
+[dsh]
+manager = "<provider id>/<model id>"
+worker = "<provider id>/<model id>"
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `dsh.manager` | session model | `provider/modelId` the manager runs on. |
+| `dsh.worker` | session model | `provider/modelId` the workers run on. |
+| `dsh.managerEffort` | unset (`high`) | Reasoning effort for the manager. |
+| `dsh.workerEffort` | unset (`high`) | Reasoning effort for the workers. |
+
+**Models.** For each role, the call's own ref (`manager_model` / `worker_model` on the tool,
+`managerModel` / `workerModel` in the API) wins over the `[dsh]` ref, which wins over the
+session model. `""` counts as absent. A bad ref in the config warns and uses the session
+model; a bad ref on a call rejects the call.
+
+**Effort.** An unset effort means `high`, dropped only when the model rejects that default.
+An explicit effort the model does not support is refused, never lowered. When the call
+names a model for that role it is rejected as `model-refused` before anything starts;
+otherwise that role's spawns are refused. Effort cannot be set per call.
+
+`maxIters`, `gate`, `callTimeoutMs`, `gateTimeoutMs`, `stateDir`, `auditLog`, `fanout`,
+`fanoutMax`, `notesMaxChars`, `planMaxChars`, and `workerMaxTokens` apply as described in
+[Configure](#configure). `providers`, `allowlist`, `roleModel`, the `*Thinking` keys,
+`trigger`, `classifier`, `autoTrigger`, and `redirectSkills` do not. There is no turn limit
+on a manager or worker call; `callTimeoutMs` bounds it.
+
+### The tool on dsh
+
+`ledger_solve` takes `task` (required), `cwd`, `plan_file`, `fanout`, `manager_model`, and
+`worker_model`. It has no `gate` argument, and a call with `gate` or any other unknown
+argument is turned down. The gate is the configured or detected one.
+
+- `cwd` defaults to the session's working directory; a relative path is resolved against it.
+- `plan_file` works as under pi; a relative path is resolved against the run directory.
+- `fanout` can only lower the configured setting. There is no dialog, so `ask` runs as
+  `no-ui`: a best-of-N recommendation runs serially.
+- The model arguments are for requests that name a model for a role.
+
+It returns `{ outcome, text }`, where `outcome` is `bad-arguments`, `inactive`, `rejected`,
+`canceled`, `busy`, `ran`, or `failed`, and `text` is the hand-off or says why there is
+none. The tool is hidden from the ledger's own managers and workers.
+
+### Programmatic API
+
+A plugin that declares `inject: ["ledgerpi"]` gets the service as `ctx.ledgerpi`. The types
+are in `packages/dsh/api.d.ts`, and the current `apiVersion` is `1`.
+
+- `status()` never throws. It returns `{ apiVersion: 1, active: true }`, or
+  `{ apiVersion: 1, active: false, reason }` with reason `env-disabled`, `switched-off`,
+  `no-dsh-table`, or `no-preset-registry`.
+- `solve(request)` never rejects. `parent` (a live agent) and `task` are required; `cwd`,
+  `gate`, `planFile`, `fanout`, `managerModel`, `workerModel`, `signal`, `onProgress`, and
+  `entry` are optional. A throw from `onProgress` is ignored.
+- `isLedgerChild(id)` says whether `id` is a running ledger manager or worker. Such an agent
+  cannot start a run.
+
+```ts
+import type { DshSolveOutcome, DshSolveRequest, LedgerpiService } from "<checkout>/packages/dsh/api.d.ts";
+
+export async function implement(
+	ledgerpi: LedgerpiService,
+	parent: DshSolveRequest["parent"],
+	signal: AbortSignal,
+): Promise<string> {
+	const outcome: DshSolveOutcome = await ledgerpi.solve({
+		parent,
+		task: "Make parse() return [] for empty input, with a test.",
+		signal,
+	});
+	switch (outcome.kind) {
+		case "ran":
+			return outcome.handoff;
+		case "rejected":
+		case "failed":
+			return outcome.message;
+		case "busy":
+			return `Another loop is editing ${outcome.root}.`;
+		case "inactive":
+			return outcome.reason;
+		case "canceled":
+			return "Canceled.";
+	}
+}
+```
+
+Every outcome carries `warnings`, a list of strings (config and argument problems that did
+not stop the call).
+
+| `kind` | Other fields | Meaning |
+| --- | --- | --- |
+| `inactive` | `reason` | The service is not running anything; the reasons are those of `status()`. |
+| `canceled` | | `signal` aborted before the loop started. |
+| `rejected` | `reason`, `message`, `field?` | The call was turned down. `reason` is `no-parent`, `nested`, `blank-task`, `bad-model-ref`, `cwd-unavailable`, `sandbox-unavailable`, `read-only-session`, `cwd-outside-workspace`, `not-git`, `bad-plan-file`, `presets-unavailable`, or `model-refused`. `field` names the request property at fault, when there is one. |
+| `busy` | `root`, `holder` | Another loop holds the work tree; `holder` is `{ pid }`, or `null` when unknown. |
+| `ran` | `result`, `handoff` | The loop ran. An abort after it started also ends here, with `result.stop: "aborted"`. |
+| `failed` | `message` | Something unexpected was thrown. Edits already made may remain in the tree. |
+
+Only `ran` writes an audit row.
+
+### Containment and permissions
+
+A dsh child's working directory is its write boundary, and dsh does not check it against
+the parent's, so ledgerpi does. The run directory is the real path of `cwd`, and the
+parent session's sandbox mode decides whether it may be used:
+
+| Sandbox mode | Run directory |
+| --- | --- |
+| `workspace-write` | Must be, or be inside, the workspace root or an additional writable root, else `cwd-outside-workspace`. Temp areas do not count. |
+| `read-only` | Refused: `read-only-session`. |
+| `danger-full-access` | Any directory. |
+| any other, or no usable sandbox policy | Refused: `sandbox-unavailable`. |
+
+- Under `workspace-write`, workers write only under the run directory plus the deployment's
+  extra writable roots and temp areas. A fan-out worker has its candidate checkout in place
+  of the run directory, so it writes only there (and in those roots and temp areas). Under
+  `danger-full-access` there is no write boundary.
+- The manager may use only `read`, `read_image`, `glob`, and `grep`; the worker may use
+  those plus `write`, `edit`, and `bash`. Every other tool is denied to both, host-wide ones
+  included, so neither can delegate, message other agents, or call `ledger_solve`. A
+  deployment that presents tools through code mode instead leaves them unable to act.
+- Managers and workers run with approval `never`: nothing prompts, and an operation the
+  sandbox does not allow fails.
+- A command a worker puts in the background with `&` is not stopped when the worker ends, and
+  can still write after the run returns.
+
+**The gate runs unsandboxed, with host privileges.** The host runs it directly through
+`/bin/sh`, outside dsh's sandbox and with no approval, and what it runs comes from files in
+the work tree. A sandboxed parent can write a Makefile (or `.ledgerpi-gate`) and have
+`ledger_solve` run it unsandboxed, and a worker can edit whatever the gate executes.
+**dsh's sandbox does not contain a hostile worker.** Offer the tool and the service only
+where that is acceptable.
+
+### Running alongside other work
+
+- **Subagent limit.** Set `maxActiveSubagents` (on the `subagent` row, default 8) to at least
+  `fanoutMax` plus the other children of the same agent tree. dsh does not queue a spawn over
+  the limit: it is refused, and that manager or worker call fails.
+- **Locks.** A dsh run takes the same per-work-tree lock as `ledgerctl`, marked as held by a
+  shared host process, because the holder pid is the dsh server. `ledgerctl stop` does not
+  signal such a holder; interrupt the turn that called the tool, or abort the request's
+  `signal`. A server killed during a run leaves its lock file behind: a restarted server
+  with the same pid, as in a container, takes the lock over, though `ledgerctl status` shows
+  it held until then. Do not share a state directory between containers or hosts: the lock
+  identifies its holder by pid alone. A `ledgerctl` built before this mark existed does
+  signal it, so run `make build` and reinstall it.
+- **Audit rows.** They have `harness: "dsh"`, `entry: "tool"` or `"service"`, the parent's
+  id as `session`, and the parent's route as `provider` and `model`. `managerModel` and
+  `workerModel` are the models that answered, else the requested or `[dsh]` ref, else `null`
+  for the session model. `managerTokens` and `workerTokens` are recorded; each message
+  counts the total dsh reports, or input plus output (without cache reads and writes) when
+  it reports no total.
+
 ## Configure
 
 **Required.** ledgerpi reads a tracked TOML file and is fail-closed: on pi, without a
 config file that names at least one provider, it is **inert** -- every input and
 every `ledger_solve` call passes straight through. Under Claude Code the `[claude]`
-table is the opt-in instead. There is no built-in provider fallback, so a missing or
-malformed config never silently runs the loop.
+table is the opt-in instead, and under dsh the [`[dsh]` table](#configure-dsh). There is
+no built-in provider fallback, so a missing or malformed config never silently runs the
+loop.
 
 Copy `ledgerpi.example.toml` to `~/.config/ledgerpi/config.toml`. The path is
 `$LEDGERPI_CONFIG` if set, else `$XDG_CONFIG_HOME/ledgerpi/config.toml`, else
@@ -568,12 +774,12 @@ cerebras = ["gemma-4-31B"]   # restrict cerebras to this model; omit the entry t
 | `workerThinking` | `high` | Thinking level for the worker role. |
 | `managerThinking` | `high` | Thinking level for the manager role. |
 | `roleModel` | `null` (absent) | Per-session-model role pins and activation narrowing: `"provider/modelId" = { manager = "provider/modelId", worker = "provider/modelId" }`. An absent table leaves activation to the provider and allowlist alone; a present table, even an empty one, narrows activation to the session models it lists, and an entry's session model spawns the two roles on the entry's two models. The reserved key `default = { manager = "provider/modelId", worker = "provider/modelId" }` is the fallback pin for session models with no entry: it names at least one of the two roles, and its presence widens activation back to every allowlisted model; a named entry wins over it. A malformed table, entry, or default is reported and dropped (a malformed entry's session model stays inactive); it never makes the config inert. |
-| `workerMaxTokens` | `{}` | Output-token cap for worker spawns only: `"provider/modelId" = <positive integer>`, e.g. `"local-router/qwen3.8-27b" = 65536`. The key is the worker's effective model (the `[roleModel]` worker, else the session model); a worker whose model has no entry keeps the model's default cap, and the manager is never capped. A malformed table or entry (a key that is not `provider/modelId`, a value that is not a positive integer) is reported and dropped; it never makes the config inert. A model the pi registry does not know is reported at first use and the worker keeps its default cap. A cap at or above the model's context window warns but still applies. A capped worker is spawned on an explicit model, even when it runs on the session model, so pi-subagents' Model Scope applies to it as it does to a pinned model (the model must be in `enabledModels` when scope is on) and an agent-type `model:` frontmatter no longer picks its model. pi only; the Claude path ignores it. |
+| `workerMaxTokens` | `{}` | Output-token cap for worker spawns only: `"provider/modelId" = <positive integer>`, e.g. `"local-router/qwen3.8-27b" = 65536`. The key is the worker's effective model (the `[roleModel]` worker, else the session model); a worker whose model has no entry keeps the model's default cap, and the manager is never capped. A malformed table or entry (a key that is not `provider/modelId`, a value that is not a positive integer) is reported and dropped; it never makes the config inert. A model the pi registry does not know is reported at first use and the worker keeps its default cap. A cap at or above the model's context window warns but still applies. A capped worker is spawned on an explicit model, even when it runs on the session model, so pi-subagents' Model Scope applies to it as it does to a pinned model (the model must be in `enabledModels` when scope is on) and an agent-type `model:` frontmatter no longer picks its model. dsh applies the cap too, keyed by the call's or `[dsh]` worker, else the session model; there a role with no cap inherits the session's own output cap, if it has one, and the pi registry and Model Scope notes do not apply. The Claude path ignores the table. |
 | `trigger` | `ask` | How the `input` hook starts the loop on an eligible coding prompt. `ask` shows a Run / Skip / Skip-for-session dialog (print mode, with no UI, passes through; an RPC client receives the dialog and must answer it); `auto` runs without asking; `manual` never runs from the hook and makes no classifier call -- only `/ledger` and `ledger_solve` start runs. |
 | `classifier` | `true` | Whether to run the code-vs-chat classifier. False bypasses classification only: every eligible prompt is treated as code and goes on to `trigger` (asked under `ask`, run under `auto`, never under `manual`); it does not bypass the unconditional continuation-only and escape guards. |
 | `autoTrigger` | `off` | Trigger mode for skill/slash sessions. `redirect` blocks the first inline edit in such a session and steers the model to `ledger_solve`; `off` leaves the tool as the only such path. |
 | `redirectSkills` | `[]` | Slash-command names (no leading `/`; a `skill:` prefix is optional and ignored) the `redirect` mode arms for. Only consulted under `autoTrigger="redirect"`. Empty is fail-closed (arms nothing); `["*"]` arms every skill session. |
-| `fanout` | `off` | Concurrent workers per round. `off` runs one worker per round and never asks the manager for a recommendation; `advise` asks the manager for a `### MODE` recommendation each round and records it, but still runs serially; `ask` runs the round as best-of-N only after you confirm it in a dialog (without one, as under `ledgerctl`, headless pi, or `ledger_solve` without a UI, it runs serially as `no-ui`); `on` runs the round as best-of-N without asking when the manager recommends it and the repo has a gate. A per-call `fanout` (`ledger_solve`, `ledgerctl solve --fanout`) can only lower this. An unrecognized value is ignored and the setting stays `off`. See [Fan-out](#fan-out). |
+| `fanout` | `off` | Concurrent workers per round. `off` runs one worker per round and never asks the manager for a recommendation; `advise` asks the manager for a `### MODE` recommendation each round and records it, but still runs serially; `ask` runs the round as best-of-N only after you confirm it in a dialog (without one, as under `ledgerctl`, dsh, headless pi, or `ledger_solve` without a UI, it runs serially as `no-ui`); `on` runs the round as best-of-N without asking when the manager recommends it and the repo has a gate. A per-call `fanout` (`ledger_solve`, `ledgerctl solve --fanout`) can only lower this. An unrecognized value is ignored and the setting stays `off`. See [Fan-out](#fan-out). |
 | `fanoutMax` | `2` | Workers a best-of-N round runs at once: an integer from 2 to 8. Out of range or not an integer warns and uses `2`. |
 | `callTimeoutMs` | `300000` | Per manager/worker call timeout. A fan-out worker queued behind a full sub-agent concurrency limit counts its wait against this. |
 | `gateTimeoutMs` | `180000` | Gate command timeout. |
@@ -595,8 +801,8 @@ once, at session start. The manager and worker sub-agents load their own copy of
 ledgerpi in the same process, and while a UI session is live their copies never
 write to its terminal.
 
-`LEDGERPI=0` in the environment disables the extension for one process, which is
-the A/B off switch. `LEDGERPI_DEBUG=1` logs each input decision to stderr
+`LEDGERPI=0` in the environment disables ledgerpi, on every harness, for one process,
+which is the A/B off switch. `LEDGERPI_DEBUG=1` logs each input decision to stderr
 (which guard bailed, the classifier verdict), for diagnosing a silent
 pass-through. `LEDGERPI_STATE_DIR=<dir>` overrides the state dir for one
 process, so concurrent runs can isolate their ledgers. `LEDGERPI_AUDIT_LOG=<path>`
@@ -778,14 +984,15 @@ this repo. It never applies a provider, allowlist, `maxIters`, thinking-level, o
 
 `make check` is the gate: Biome (format, lint, import order) plus a tsc
 typecheck plus the test suites, which drive the `input` handler against a stub RPC
-bus and `ledgerctl` as the plugin's mod would. `make bootstrap` installs the dev tooling. The `bench/worker-thinking` test also needs `jq`, `procps` and `timeout` on the host.
-`make build` compiles `ledgerctl`, and `make test-plugin` validates the plugin, runs its
+bus, `ledgerctl` as the plugin's mod would, and the dsh adapter against fake dsh services. `make bootstrap` installs the dev tooling. The `bench/worker-thinking` test also needs `jq`, `procps` and `timeout` on the host.
+`make build` compiles `ledgerctl` and builds the dsh bundle, and `make test-plugin` validates the plugin, runs its
 mod tests, and typechecks the mod. That target needs the `claude` CLI, so CI does not run
 it, and the typecheck needs the types a session writes when it first loads the plugin
 (`claude --plugin-dir packages/claude`); without them the target says it skipped.
 
 `packages/core` is harness-neutral and imports nothing from pi. `extensions/ledgerpi` is
-the pi adapter and `packages/claude` is the Claude Code adapter; each supplies a `SpawnFn`.
+the pi adapter, `packages/claude` is the Claude Code adapter, and `packages/dsh` is the dsh
+adapter; each supplies a `SpawnFn`.
 
 ## License
 

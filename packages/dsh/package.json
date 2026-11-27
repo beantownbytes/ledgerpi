@@ -1,0 +1,21 @@
+{
+	"name": "ledgerpi-dsh",
+	"private": true,
+	"type": "module",
+	"engines": {
+		"dsh": "0.2.3-alpha.2"
+	},
+	"dsh": {
+		"bundle": {
+			"patch": "./dist/cordis.patch.yml"
+		}
+	},
+	"exports": {
+		".": {
+			"types": "./api.d.ts",
+			"default": "./dist/service.js"
+		},
+		"./tool": "./dist/tool.js"
+	},
+	"types": "./api.d.ts"
+}

@@ -1,16 +1,17 @@
 # Universal Makefile for the ledgerpi project.
 # Same surface for dev + CI. Run `make help` for the target list.
 #
-# ledgerpi is a TypeScript pi extension plus a Claude Code plugin. pi loads the
-# extension directly; the plugin needs the compiled ledgerctl on PATH. There are no
-# cross-compile targets or release artifacts. The gate is tsc typecheck + Biome
-# lint/format + the test suites.
+# ledgerpi is a TypeScript pi extension, a Claude Code plugin and a dsh bundle. pi
+# loads the extension directly; the plugin needs the compiled ledgerctl on PATH, and
+# dsh loads the build output in packages/dsh/dist. There are no cross-compile targets
+# or release artifacts. The gate is tsc typecheck + Biome lint/format + the test
+# suites.
 
 DIST         := dist
 VERSION      := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 # Recursive (not :=) so a single `make bootstrap check` sees node_modules after bootstrap installs it.
 NPM_BIN      = $(if $(wildcard node_modules/.bin),node_modules/.bin/,)
-EXTRA_CLEAN  := node_modules bin
+EXTRA_CLEAN  := node_modules bin packages/dsh/dist
 PREFIX       ?= $(HOME)/.local
 
 .PHONY: help bootstrap build install uninstall typecheck test test-plugin fmt fmt-check lint check version clean
@@ -28,8 +29,10 @@ bootstrap: ## Install dev tooling from the lockfile (typescript + biome + pi typ
 	npm ci
 	@echo "bootstrap complete"
 
-build: ## Compile bin/ledgerctl for the Claude Code plugin. pi needs no build step.
+build: ## Compile bin/ledgerctl for the Claude Code plugin and the dsh bundle. pi needs no build step.
 	bun build --compile packages/claude/src/bin/ledgerctl.ts --outfile bin/ledgerctl
+	bun build --target node --format esm --outdir packages/dsh/dist packages/dsh/src/service.ts packages/dsh/src/tool.ts
+	bun packages/dsh/build-patch.ts
 
 install: build ## Install ledgerctl into $(PREFIX)/bin.
 	install -d $(PREFIX)/bin

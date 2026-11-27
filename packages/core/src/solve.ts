@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type AuditMeta, auditRun } from "./audit.ts";
-import { asFanoutSetting, type FanoutSetting, type LedgerpiConfig, lowerFanout } from "./config.ts";
+import { asFanoutSetting, type LedgerpiConfig } from "./config.ts";
 import { readPlanFile } from "./files.ts";
 import { detectGate } from "./gate.ts";
 import { headInfo, isGitRepo, workTreeRoot } from "./git.ts";
@@ -48,7 +48,16 @@ export interface SolveRejection {
 /** An adapter's own check before the lock: a rejection, or null to go on. */
 export type SolveCheck = () => SolveRejection | null | Promise<SolveRejection | null>;
 
-/** What a harness supplies to `solveTask`. */
+/**
+ * What a harness supplies to `solveTask`.
+ *
+ * The harness owns these checks, before the call or in a hook: whether it is active,
+ * whether the call is already aborted, the parent session and nesting, resolving the
+ * run directory (`args.cwd` arrives absolute, and a harness that contains it passes
+ * its real path), containment, the model refs, their efforts, and the presets.
+ * `solveTask` owns the blank task, the git work tree, the plan file, the fan-out
+ * warning, the lock, the run and its audit row.
+ */
 export interface SolveHost {
 	harness: SolveHarness;
 	/** The entry point stamped on the audit row. */
@@ -69,8 +78,6 @@ export interface SolveHost {
 	warn?: (message: string) => void;
 	/** Builds the run's `SpawnFn` and the tally it accumulates, once the work tree is locked. */
 	spawner: (ledger: Ledger) => { spawn: SpawnFn; tally: RoleTally };
-	/** The most permissive fan-out setting this run may use; it only ever lowers one. */
-	fanoutCap?: FanoutSetting;
 	/** Run once the task is known to be non-blank, before the directory is looked at. */
 	checkArgs?: SolveCheck;
 	/** Run once the work tree is known to be a git repository. */
@@ -114,12 +121,24 @@ function modelMismatches(host: SolveHost, tally: RoleTally): string[] {
 	});
 }
 
+/** The live holder of the lock on work tree `root`, or null when there is none or it cannot be read. */
+function readableHolder(stateDir: string, root: string): LockHolder | null {
+	try {
+		return lockHolder(stateDir, root);
+	} catch {
+		return null;
+	}
+}
+
 /**
- * Run one `ledger_solve` call for a harness that has already found itself active:
- * check the task, work tree, plan file and fan-out setting, run the harness's own
- * checks, lock the work tree, run the loop, and write its audit row. An unrecognized
- * fan-out setting is passed to the host's `warn` and ignored. An abort seen before the lock is taken
- * ends the call as `canceled`. The lock is released before this returns or throws.
+ * Run one `ledger_solve` call: check the task, work tree, plan file and fan-out
+ * setting, running the harness's hooks between them, then lock the work tree, run the
+ * loop and write its audit row. `SolveHost` says which checks are the harness's. An
+ * unrecognized fan-out setting is passed to the host's `warn` and ignored.
+ *
+ * An abort seen after a hook returns, or at the last look before the lock, ends the
+ * call as `canceled`, whatever the hook found. A rejection from one of the checks made
+ * here can come first. The lock is released before this returns or throws.
  *
  * @returns how the call ended.
  * @throws when a check, the lock or the run itself fails unexpectedly.
@@ -152,21 +171,21 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 		if ("error" in read) return reject("bad-plan-file", `${read.error}.`, "planFile");
 		plan = read.plan;
 	}
-	const requested = asFanoutSetting(args.fanout);
-	if (args.fanout !== undefined && requested === undefined) {
+	const fanout = asFanoutSetting(args.fanout);
+	if (args.fanout !== undefined && fanout === undefined) {
 		(host.warn ?? report)(
 			`[ledgerpi] ignoring ${FANOUT_ARGUMENT[host.harness]} ${JSON.stringify(args.fanout)}: expected off, advise, ask or on`,
 		);
 	}
-	const fanout = host.fanoutCap ? lowerFanout(requested ?? cfg.fanout, host.fanoutCap) : requested;
 	if (host.beforeLock) {
 		const problem = await host.beforeLock();
 		if (host.signal.aborted) return { kind: "canceled" };
 		if (problem !== null) return { kind: "rejected", ...problem };
 	}
 	if (host.signal.aborted) return { kind: "canceled" };
-	const release = acquireLock(cfg.stateDir, root);
-	if (release === null) return { kind: "busy", root, holder: lockHolder(cfg.stateDir, root) };
+	// A dsh run lives inside the dsh server, so stopping it must not signal that process.
+	const release = acquireLock(cfg.stateDir, root, { sharedProcess: host.harness === "dsh" });
+	if (release === null) return { kind: "busy", root, holder: readableHolder(cfg.stateDir, root) };
 
 	try {
 		const ledger = new Ledger(cfg, args.session, `${Date.now()}-${randomUUID().slice(0, 8)}`);
