@@ -2859,11 +2859,11 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(repo), diffStat(repo), h
 			writeFileSync(join(inner, ".git", "hooks", hook), `#!/bin/sh\necho ${hook} >> '${marks}'\n`, { mode: 0o755 });
 		}
 
-		const plainTree = (repo: string, mode: "-A" | "-u") => {
+		const plainTree = (repo: string, mode: "-A" | "-u", ...pathspec: string[]) => {
 			const env = { ...process.env, GIT_INDEX_FILE: join(root, "plain-index") };
 			copyFileSync(resolve(repo, g(repo, "rev-parse", "--git-path", "index")), env.GIT_INDEX_FILE);
 			const run = (...args: string[]) => execFileSync("git", args, { cwd: repo, env, stdio: "pipe" });
-			run("add", mode);
+			run("add", mode, ...pathspec);
 			const tree = run("write-tree").toString("utf8").trim();
 			rmSync(env.GIT_INDEX_FILE);
 			return tree;
@@ -2966,6 +2966,10 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(repo), diffStat(repo), h
 				writeFileSync(join(repo, "sub", "f.txt"), "bravo, longer\n");
 			},
 		};
+		/** Git versions disagree on whether plain add accepts an unborn submodule, so its expected tree leaves it out. */
+		const plainPathspecs: Record<string, string[]> = {
+			"submodule with no commit checked out": ["--", ".", ":(exclude)sub"],
+		};
 		const mismatched: string[] = [];
 		for (const [name, mutate] of Object.entries(cases)) {
 			for (const ignoreNone of [false, true]) {
@@ -2976,7 +2980,8 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(repo), diffStat(repo), h
 				const pin = pinned(repo);
 				const ours = [treeId(pin), trackedTreeId(pin)];
 				const started = ran();
-				const plain = [plainTree(repo, "-A"), plainTree(repo, "-u")];
+				const pathspec = plainPathspecs[name] ?? [];
+				const plain = [plainTree(repo, "-A", ...pathspec), plainTree(repo, "-u", ...pathspec)];
 				if (started !== "" || ours.join() !== plain.join()) {
 					mismatched.push(`${name} (ignore=none ${ignoreNone}): ran [${started}] ${ours} != ${plain}`);
 				}
@@ -3014,12 +3019,14 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(repo), diffStat(repo), h
 		rmSync(marks, { force: true });
 		const ignoredTrees = [treeId(pinned(ignored)), trackedTreeId(pinned(ignored))];
 		const ignoredRan = ran();
+		const ignoredDiff = g(ignored, "-c", "core.fsmonitor=false", "diff", "--name-only").split("\n");
 		check(
-			"a snapshot records the checked-out HEAD of a submodule marked ignore=all, unlike plain git add",
+			"a snapshot records the checked-out HEAD of a submodule marked ignore=all, which plain git diff hides",
 			ignoredRan === "" &&
 				ignoredTrees.every((tree) => g(ignored, "ls-tree", tree, "sub").includes(ignoredMove)) &&
-				!g(ignored, "ls-tree", plainTree(ignored, "-A"), "sub").includes(ignoredMove),
-			`ran [${ignoredRan}] ${ignoredTrees}`,
+				ignoredDiff.includes(".gitmodules") &&
+				!ignoredDiff.includes("sub"),
+			`ran [${ignoredRan}] ${ignoredTrees} diff [${ignoredDiff}]`,
 		);
 
 		const undecodable = superCopy("super-undecodable");

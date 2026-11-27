@@ -750,8 +750,9 @@ whole is still not a boundary against a hostile session or worker.**
   `--no-ext-diff --no-textconv --ignore-submodules=dirty --submodule=short`.
 - Snapshots record each checked-out tracked submodule from its HEAD, under sparse checkout
   too, so no git process starts inside a submodule. A submodule with no commit checked out
-  keeps its recorded commit. Unlike plain `git add`, a submodule marked `ignore = all` is
-  still recorded from its HEAD. A submodule path that is not valid UTF-8 fails the snapshot.
+  keeps its recorded commit. A submodule marked `ignore = all` is recorded from its HEAD,
+  even where plain `git add` would skip it. A submodule path that is not valid UTF-8 fails the
+  snapshot.
 
 What remains:
 
