@@ -2,20 +2,25 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
 	closeSync,
 	constants,
+	copyFileSync,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readFileSync,
 	readSync,
+	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { stringify as stringifyToml } from "smol-toml";
 import factory from "../extensions/ledgerpi/index.ts";
 import { spawn } from "../extensions/ledgerpi/rpc.ts";
@@ -34,12 +39,16 @@ import {
 	addCandidateWorktree,
 	applyPatch,
 	candidatePatch,
+	diffStat,
 	headInfo,
+	pinRepo,
 	pruneStaleCandidates,
 	removeCandidateWorktree,
 	revertPatch,
 	snapshotTree,
+	trackedTreeId,
 	treeId,
+	workingDiff,
 } from "../packages/core/src/git.ts";
 import { handoffBlock } from "../packages/core/src/handoff.ts";
 import { Ledger } from "../packages/core/src/ledger.ts";
@@ -47,7 +56,7 @@ import type { LoopResult } from "../packages/core/src/loop.ts";
 import { briefFor, manageSections, parseBrief, parseMode, sections } from "../packages/core/src/parse.ts";
 import { finalizePrompt, managePrompt, planPrompt, workerPrompt } from "../packages/core/src/prompts.ts";
 import { WORKER_SENTINEL } from "../packages/core/src/spawn.ts";
-import { deadPid, TIMING_KEYS } from "./helpers.ts";
+import { deadPid, pinned, TIMING_KEYS } from "./helpers.ts";
 
 const root = join(tmpdir(), `ledgerpi-test-${process.pid}`);
 const agentDirPath = join(root, "agentdir");
@@ -650,16 +659,18 @@ async function run() {
 	{
 		// git's stderr is inherited at the fd level, so only a child process can observe it.
 		const gitModule = join(import.meta.dirname, "..", "packages", "core", "src", "git.ts");
-		const probe = `import { diffStat, headInfo, isGitRepo, workingDiff } from ${JSON.stringify(gitModule)};
+		const probe = `import { diffStat, headInfo, isGitRepo, pinRepo, workingDiff } from ${JSON.stringify(gitModule)};
 const cwd = ${JSON.stringify(agentDirPath)};
-console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), headInfo(cwd)]));`;
+const gitDir = cwd + "/.git";
+const repo = { workTree: cwd, gitDir, commonDir: gitDir };
+console.log(JSON.stringify([isGitRepo(cwd), workingDiff(repo), diffStat(repo), headInfo(repo), pinRepo(cwd)]));`;
 		const child = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", probe], {
 			encoding: "utf8",
 		});
 		check(
 			"git helpers on a non-git cwd return empty results and write nothing to stderr",
 			child.status === 0 &&
-				child.stdout.trim() === JSON.stringify([false, "", "", { repoUrl: null, branch: null, sha: null }]) &&
+				child.stdout.trim() === JSON.stringify([false, "", "", { repoUrl: null, branch: null, sha: null }, null]) &&
 				child.stderr === "",
 			`status=${child.status} stdout=${child.stdout.trim()} stderr=${child.stderr.trim()}`,
 		);
@@ -2315,7 +2326,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			planSource: "manager",
 			timing: { managerMs: 0, workerMs: 0, gateMs: 0, managerCalls: 0, workerCalls: 0, gateRuns: 0 },
 		});
-		const multi = handoffBlock(repo, result("set -e\nmake lint\nmake test"));
+		const multi = handoffBlock(pinned(repo), result("set -e\nmake lint\nmake test"));
 		check(
 			"a multi-line gate leaves the hand-off summary on one line and fences the command",
 			multi.includes("Gate: FAILED. Rounds: 3. Sub-agent calls: 6. Tokens: 100.") &&
@@ -2324,12 +2335,12 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		);
 		check(
 			"a single-line gate keeps its inline hand-off summary",
-			handoffBlock(repo, result("false")).includes("Gate: FAILED (`false`). Rounds: 3."),
+			handoffBlock(pinned(repo), result("false")).includes("Gate: FAILED (`false`). Rounds: 3."),
 		);
-		const plain = handoffBlock(repo, result("false"));
+		const plain = handoffBlock(pinned(repo), result("false"));
 		check(
 			"a null fan-out summary leaves the hand-off byte-identical to an absent one, with no Fan-out line",
-			handoffBlock(repo, { ...result("false"), fanout: null }) === plain && !plain.includes("Fan-out:"),
+			handoffBlock(pinned(repo), { ...result("false"), fanout: null }) === plain && !plain.includes("Fan-out:"),
 		);
 		const summary = {
 			setting: "on" as const,
@@ -2340,10 +2351,10 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			asked: 0,
 			advised: { serial: 1, "best-of-n": 2, fleet: 1, none: 0 },
 		};
-		const fanLines = handoffBlock(repo, { ...result("false"), fanout: summary })
+		const fanLines = handoffBlock(pinned(repo), { ...result("false"), fanout: summary })
 			.split("\n")
 			.filter((l) => l.startsWith("Fan-out:"));
-		const spawnFailed = handoffBlock(repo, {
+		const spawnFailed = handoffBlock(pinned(repo), {
 			...result("false"),
 			stop: "spawn-failure" as const,
 			stopDetail: "timeout" as const,
@@ -2436,6 +2447,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			{ text: worker("solved") },
 			{ text: manage("done", "") },
 		];
+		const headPin = pinned(headRepo);
 		const stamp = (r: Record<string, any> | undefined) =>
 			JSON.stringify({ r: r?.repoUrl, b: r?.branch, s: r?.headStart, e: r?.headEnd });
 
@@ -2488,7 +2500,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 
 		const originAs = (url: string) => {
 			execFileSync("git", ["remote", "set-url", "origin", url], { cwd: headRepo });
-			return headInfo(headRepo).repoUrl;
+			return headInfo(headPin).repoUrl;
 		};
 		check(
 			"an ssh, scp-style, or local origin is stamped verbatim; a bare https token is stripped",
@@ -2498,14 +2510,14 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 				originAs("http://tok3n@git.example.org/o/r.git") === "http://git.example.org/o/r.git" &&
 				originAs("https://user:p@ss@git.example.org/o/r.git") === "https://git.example.org/o/r.git" &&
 				originAs("https://git.example.org/o/r@v1.git") === "https://git.example.org/o/r@v1.git",
-			String(headInfo(headRepo).repoUrl),
+			String(headInfo(headPin).repoUrl),
 		);
 
 		execFileSync("git", ["tag", "feat/x"], { cwd: headRepo });
 		check(
 			"a tag sharing the branch name does not change the stamped branch",
-			headInfo(headRepo).branch === "feat/x",
-			String(headInfo(headRepo).branch),
+			headInfo(headPin).branch === "feat/x",
+			String(headInfo(headPin).branch),
 		);
 
 		execFileSync("git", ["switch", "-q", "--detach"], { cwd: headRepo });
@@ -2548,8 +2560,8 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			.at(-1);
 		check(
 			"a run that loses its origin and branch mid-loop keeps the start origin and branch",
-			headInfo(headRepo).repoUrl === null &&
-				headInfo(headRepo).branch === null &&
+			headInfo(headPin).repoUrl === null &&
+				headInfo(headPin).branch === null &&
 				movedRow?.repoUrl === "https://git.example.org/o/r.git" &&
 				movedRow?.branch === "feat/x",
 			stamp(movedRow),
@@ -2576,7 +2588,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 			.at(-1);
 		check(
 			"a run whose origin and branch change mid-loop stamps the end origin and the start branch",
-			headInfo(headRepo).branch === "feat/y" &&
+			headInfo(headPin).branch === "feat/y" &&
 				swappedRow?.repoUrl === "https://git.example.org/other/r.git" &&
 				swappedRow?.branch === "feat/x",
 			stamp(swappedRow),
@@ -2604,9 +2616,10 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		writeFileSync(join(snapRepo, "untracked.txt"), "fresh\n");
 		writeFileSync(join(snapRepo, "ignored.txt"), "skip\n");
 
+		const snapPin = pinned(snapRepo);
 		const cachedBefore = g(snapRepo, "diff", "--cached");
 		const indexBefore = readFileSync(join(snapRepo, ".git", "index"));
-		const base = snapshotTree(snapRepo);
+		const base = snapshotTree(snapPin);
 		const shown = (rev: string, path: string) => g(snapRepo, "show", `${rev}:${path}`);
 		check(
 			"snapshotTree captures staged, unstaged, and untracked changes and skips ignored files",
@@ -2625,157 +2638,157 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		check(
 			"snapshotTree is a dangling commit on HEAD and treeId agrees with its tree",
 			g(snapRepo, "rev-parse", `${base}^`) === g(snapRepo, "rev-parse", "HEAD") &&
-				treeId(snapRepo) === treeId(snapRepo, base),
+				treeId(snapPin) === treeId(snapPin, base),
 		);
 
-		const candidate = addCandidateWorktree(snapRepo, snapLedger, 3, 1, base);
+		const candidate = addCandidateWorktree(snapPin, snapLedger, 3, 1, base);
 		const listing = g(snapRepo, "worktree", "list", "--porcelain");
 		check(
 			"addCandidateWorktree makes a detached, locked worktree at the snapshot under <ledgerDir>/candidates/<iter>-<i>",
-			candidate === join(snapLedger, "candidates", "3-1") &&
-				g(candidate, "rev-parse", "HEAD") === base &&
+			candidate.workTree === join(snapLedger, "candidates", "3-1") &&
+				g(candidate.workTree, "rev-parse", "HEAD") === base &&
 				listing.includes(`locked ledgerpi:${process.pid}`) &&
-				listing.includes(candidate) &&
+				listing.includes(candidate.workTree) &&
 				/^detached$/m.test(listing) &&
-				readFileSync(join(candidate, "untracked.txt"), "utf8") === "fresh\n",
+				readFileSync(join(candidate.workTree, "untracked.txt"), "utf8") === "fresh\n",
 			listing,
 		);
 
-		writeFileSync(join(candidate, "edited.txt"), "alpha\nbeta\ngamma\n");
-		writeFileSync(join(candidate, "brand-new.txt"), "new file\n");
-		writeFileSync(join(candidate, "icon.bin"), Buffer.from([9, 0, 255, 128, 3]));
-		writeFileSync(join(candidate, "added.bin"), Buffer.from([0, 0, 1, 2, 3, 250]));
-		rmSync(join(candidate, "gone.txt"));
+		writeFileSync(join(candidate.workTree, "edited.txt"), "alpha\nbeta\ngamma\n");
+		writeFileSync(join(candidate.workTree, "brand-new.txt"), "new file\n");
+		writeFileSync(join(candidate.workTree, "icon.bin"), Buffer.from([9, 0, 255, 128, 3]));
+		writeFileSync(join(candidate.workTree, "added.bin"), Buffer.from([0, 0, 1, 2, 3, 250]));
+		rmSync(join(candidate.workTree, "gone.txt"));
 		const patch = candidatePatch(candidate, base);
-		const before = treeId(snapRepo);
-		applyPatch(snapRepo, patch);
+		const before = treeId(snapPin);
+		applyPatch(snapPin, patch);
 		check(
 			"candidatePatch then applyPatch reproduces text, new, deleted, and binary changes on the real tree",
-			treeId(snapRepo) === treeId(candidate) &&
+			treeId(snapPin) === treeId(candidate) &&
 				readFileSync(join(snapRepo, "edited.txt"), "utf8") === "alpha\nbeta\ngamma\n" &&
 				readFileSync(join(snapRepo, "icon.bin")).equals(Buffer.from([9, 0, 255, 128, 3])) &&
 				readFileSync(join(snapRepo, "added.bin")).equals(Buffer.from([0, 0, 1, 2, 3, 250])) &&
 				!existsSync(join(snapRepo, "gone.txt")),
 		);
-		revertPatch(snapRepo, patch);
+		revertPatch(snapPin, patch);
 		check(
 			"revertPatch restores the tree id from before the apply",
-			treeId(snapRepo) === before &&
+			treeId(snapPin) === before &&
 				existsSync(join(snapRepo, "gone.txt")) &&
 				!existsSync(join(snapRepo, "added.bin")),
 		);
 
-		applyPatch(snapRepo, patch);
-		const applied = treeId(snapRepo);
+		applyPatch(snapPin, patch);
+		const applied = treeId(snapPin);
 		let threw = false;
 		try {
-			applyPatch(snapRepo, patch);
+			applyPatch(snapPin, patch);
 		} catch {
 			threw = true;
 		}
-		check("a patch that does not apply throws and leaves the tree unchanged", threw && treeId(snapRepo) === applied);
+		check("a patch that does not apply throws and leaves the tree unchanged", threw && treeId(snapPin) === applied);
 		let revertThrew = false;
 		writeFileSync(join(snapRepo, "edited.txt"), "diverged\n");
-		const diverged = treeId(snapRepo);
+		const diverged = treeId(snapPin);
 		try {
-			revertPatch(snapRepo, patch);
+			revertPatch(snapPin, patch);
 		} catch {
 			revertThrew = true;
 		}
 		check(
 			"a revert that does not apply throws and leaves the tree unchanged",
-			revertThrew && treeId(snapRepo) === diverged,
+			revertThrew && treeId(snapPin) === diverged,
 		);
 		check(
 			"an empty patch applies as a no-op",
 			(() => {
-				const t = treeId(snapRepo);
-				applyPatch(snapRepo, candidatePatch(snapRepo, snapshotTree(snapRepo)));
-				return treeId(snapRepo) === t;
+				const t = treeId(snapPin);
+				applyPatch(snapPin, candidatePatch(snapPin, snapshotTree(snapPin)));
+				return treeId(snapPin) === t;
 			})(),
 		);
 
 		g(snapRepo, "config", "diff.noprefix", "true");
 		g(snapRepo, "config", "diff.mnemonicPrefix", "true");
 		g(snapRepo, "config", "apply.whitespace", "error");
-		const configBase = snapshotTree(snapRepo);
-		const configured = addCandidateWorktree(snapRepo, snapLedger, 5, 1, configBase);
-		writeFileSync(join(configured, "brand-new.txt"), "trailing space \n");
+		const configBase = snapshotTree(snapPin);
+		const configured = addCandidateWorktree(snapPin, snapLedger, 5, 1, configBase);
+		writeFileSync(join(configured.workTree, "brand-new.txt"), "trailing space \n");
 		const configuredPatch = candidatePatch(configured, configBase);
-		const configuredBefore = treeId(snapRepo);
+		const configuredBefore = treeId(snapPin);
 		let configuredApplied = false;
 		try {
-			applyPatch(snapRepo, configuredPatch);
+			applyPatch(snapPin, configuredPatch);
 			configuredApplied = readFileSync(join(snapRepo, "brand-new.txt"), "utf8") === "trailing space \n";
-			revertPatch(snapRepo, configuredPatch);
+			revertPatch(snapPin, configuredPatch);
 		} catch {}
 		check(
 			"candidatePatch and applyPatch ignore diff.noprefix, diff.mnemonicPrefix and apply.whitespace=error in the user's git config",
 			configuredPatch.toString("utf8").includes("diff --git a/brand-new.txt b/brand-new.txt") &&
 				configuredApplied &&
-				treeId(snapRepo) === configuredBefore,
+				treeId(snapPin) === configuredBefore,
 		);
-		removeCandidateWorktree(snapRepo, configured);
+		removeCandidateWorktree(snapPin, configured);
 		for (const key of ["diff.noprefix", "diff.mnemonicPrefix", "apply.whitespace"]) {
 			g(snapRepo, "config", "--unset", key);
 		}
 
 		g(snapRepo, "config", "diff.up.textconv", "tr a-z A-Z <");
-		const converted = addCandidateWorktree(snapRepo, snapLedger, 7, 1, configBase);
-		writeFileSync(join(converted, ".gitattributes"), "*.dat diff=up\n");
-		writeFileSync(join(converted, "payload.dat"), "lowercase payload\n");
+		const converted = addCandidateWorktree(snapPin, snapLedger, 7, 1, configBase);
+		writeFileSync(join(converted.workTree, ".gitattributes"), "*.dat diff=up\n");
+		writeFileSync(join(converted.workTree, "payload.dat"), "lowercase payload\n");
 		const convertedPatch = candidatePatch(converted, configBase);
-		const convertedBefore = treeId(snapRepo);
+		const convertedBefore = treeId(snapPin);
 		let convertedApplied = false;
 		try {
-			applyPatch(snapRepo, convertedPatch);
+			applyPatch(snapPin, convertedPatch);
 			convertedApplied = readFileSync(join(snapRepo, "payload.dat"), "utf8") === "lowercase payload\n";
-			revertPatch(snapRepo, convertedPatch);
+			revertPatch(snapPin, convertedPatch);
 		} catch {}
 		check(
 			"candidatePatch ignores a diff textconv driver, so the patch carries the real file content",
 			convertedPatch.toString("utf8").includes("lowercase payload") &&
 				convertedApplied &&
-				treeId(snapRepo) === convertedBefore,
+				treeId(snapPin) === convertedBefore,
 		);
-		removeCandidateWorktree(snapRepo, converted);
+		removeCandidateWorktree(snapPin, converted);
 		g(snapRepo, "config", "--unset", "diff.up.textconv");
 
 		const hooksDir = join(snapRepo, ".git", "hooks");
 		const marker = join(root, "post-checkout-ran");
 		mkdirSync(hooksDir, { recursive: true });
 		writeFileSync(join(hooksDir, "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
-		const hooked = addCandidateWorktree(snapRepo, snapLedger, 6, 1, base);
+		const hooked = addCandidateWorktree(snapPin, snapLedger, 6, 1, base);
 		check("addCandidateWorktree does not run the repository's post-checkout hook", !existsSync(marker));
 		rmSync(join(hooksDir, "post-checkout"));
 
 		const ghost = join(root, "ghost-wt");
 		g(snapRepo, "worktree", "add", "-q", "--detach", ghost, base);
 		rmSync(ghost, { recursive: true, force: true });
-		removeCandidateWorktree(snapRepo, hooked);
+		removeCandidateWorktree(snapPin, hooked);
 		check(
 			"removeCandidateWorktree leaves the metadata of an unrelated worktree whose directory is missing",
-			g(snapRepo, "worktree", "list", "--porcelain").includes(ghost) && !existsSync(hooked),
+			g(snapRepo, "worktree", "list", "--porcelain").includes(ghost) && !existsSync(hooked.workTree),
 		);
 		g(snapRepo, "worktree", "prune");
 
-		const live = addCandidateWorktree(snapRepo, snapLedger, 4, 1, base);
-		const stale = addCandidateWorktree(snapRepo, snapLedger, 4, 2, base);
+		const live = addCandidateWorktree(snapPin, snapLedger, 4, 1, base);
+		const stale = addCandidateWorktree(snapPin, snapLedger, 4, 2, base);
 		const staleId = await deadPid();
-		g(snapRepo, "worktree", "unlock", stale);
-		g(snapRepo, "worktree", "lock", "--reason", `ledgerpi:${staleId}`, stale);
+		g(snapRepo, "worktree", "unlock", stale.workTree);
+		g(snapRepo, "worktree", "lock", "--reason", `ledgerpi:${staleId}`, stale.workTree);
 		const outside = join(root, "outside-wt");
 		g(snapRepo, "worktree", "add", "-q", "--detach", "--lock", "--reason", `ledgerpi:${staleId}`, outside, base);
-		const pruned = pruneStaleCandidates(snapRepo, snapLedger);
+		const pruned = pruneStaleCandidates(snapPin, snapLedger);
 		const after = g(snapRepo, "worktree", "list", "--porcelain");
 		check(
 			"pruneStaleCandidates removes a candidate locked by a dead pid and keeps live and unrelated worktrees",
 			pruned.length === 1 &&
-				pruned[0] === stale &&
-				!existsSync(stale) &&
-				!after.includes(stale) &&
-				after.includes(live) &&
-				after.includes(candidate) &&
+				pruned[0] === stale.workTree &&
+				!existsSync(stale.workTree) &&
+				!after.includes(stale.workTree) &&
+				after.includes(live.workTree) &&
+				after.includes(candidate.workTree) &&
 				after.includes(outside),
 			`${JSON.stringify(pruned)}\n${after}`,
 		);
@@ -2787,7 +2800,7 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 		for (const path of [nestedStale, nonCandidate]) {
 			g(snapRepo, "worktree", "add", "-q", "--detach", "--lock", "--reason", `ledgerpi:${staleId}`, path, base);
 		}
-		const prunedNested = pruneStaleCandidates(snapRepo, snapLedger);
+		const prunedNested = pruneStaleCandidates(snapPin, snapLedger);
 		const afterNested = g(snapRepo, "worktree", "list", "--porcelain");
 		check(
 			"pruneStaleCandidates scans every <session>/<turn>/candidates directory under the state dir, and only those",
@@ -2796,24 +2809,706 @@ console.log(JSON.stringify([isGitRepo(cwd), workingDiff(cwd), diffStat(cwd), hea
 				!existsSync(nestedStale) &&
 				!afterNested.includes(nestedStale) &&
 				afterNested.includes(nonCandidate) &&
-				afterNested.includes(live),
+				afterNested.includes(live.workTree),
 			`${JSON.stringify(prunedNested)}\n${afterNested}`,
 		);
-		removeCandidateWorktree(snapRepo, nonCandidate);
+		removeCandidateWorktree(snapPin, pinned(nonCandidate));
 
-		for (const path of [candidate, live]) removeCandidateWorktree(snapRepo, path);
-		removeCandidateWorktree(snapRepo, outside);
+		for (const repo of [candidate, live]) removeCandidateWorktree(snapPin, repo);
+		removeCandidateWorktree(snapPin, pinned(outside));
 		const finalList = g(snapRepo, "worktree", "list", "--porcelain");
 		check(
 			"removeCandidateWorktree removes a locked worktree from disk and from the list",
-			!existsSync(candidate) &&
-				!existsSync(live) &&
+			!existsSync(candidate.workTree) &&
+				!existsSync(live.workTree) &&
 				!finalList.includes("candidates") &&
 				!finalList.includes(outside),
 			finalList,
 		);
-		removeCandidateWorktree(snapRepo, candidate);
+		removeCandidateWorktree(snapPin, candidate);
 		check("removing a worktree that is already gone does not throw", true);
+
+		const template = join(root, "repo-super");
+		const marks = join(root, "submodule-marks");
+		const trap = (name: string, then: "cat" | "true") => `echo ${name} >> '${marks}'; ${then}`;
+		const ran = () => (existsSync(marks) ? readFileSync(marks, "utf8") : "");
+		const commitAll = (cwd: string, message: string) => {
+			g(cwd, "add", "--no-warn-embedded-repo", "-A");
+			g(cwd, ...gitIdent, "commit", "-q", "--allow-empty", "-m", message);
+		};
+		const inner = join(template, "sub");
+		mkdirSync(inner, { recursive: true });
+		g(template, "init", "-q");
+		g(inner, "init", "-q");
+		writeFileSync(join(inner, "f.txt"), "alpha\n");
+		commitAll(inner, "one");
+		writeFileSync(join(template, ".gitmodules"), '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n');
+		writeFileSync(join(template, "top.txt"), "top\n");
+		commitAll(template, "base");
+		g(template, "config", "diff.submodule", "diff");
+		writeFileSync(join(inner, ".git", "info", "attributes"), "* filter=trap diff=trap\n");
+		for (const [key, name, then] of [
+			["core.fsmonitor", "fsmonitor", "true"],
+			["diff.external", "external", "true"],
+			["diff.trap.textconv", "textconv", "cat"],
+			["filter.trap.clean", "clean", "cat"],
+		] as const) {
+			g(inner, "config", key, trap(name, then));
+		}
+		for (const hook of ["post-index-change", "reference-transaction"]) {
+			writeFileSync(join(inner, ".git", "hooks", hook), `#!/bin/sh\necho ${hook} >> '${marks}'\n`, { mode: 0o755 });
+		}
+
+		const plainTree = (repo: string, mode: "-A" | "-u") => {
+			const env = { ...process.env, GIT_INDEX_FILE: join(root, "plain-index") };
+			copyFileSync(resolve(repo, g(repo, "rev-parse", "--git-path", "index")), env.GIT_INDEX_FILE);
+			const run = (...args: string[]) => execFileSync("git", args, { cwd: repo, env, stdio: "pipe" });
+			run("add", mode);
+			const tree = run("write-tree").toString("utf8").trim();
+			rmSync(env.GIT_INDEX_FILE);
+			return tree;
+		};
+		const superCopy = (name: string) => {
+			const repo = join(root, name);
+			rmSync(repo, { recursive: true, force: true });
+			cpSync(template, repo, { recursive: true });
+			rmSync(marks, { force: true });
+			return repo;
+		};
+		/** Move the submodule's HEAD, then leave a same-size edit there that a status inside it must rehash. */
+		const moveAndDirty = (repo: string) => {
+			const sub = join(repo, "sub");
+			const env = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"];
+			writeFileSync(join(sub, "f.txt"), "gamma\n");
+			g(sub, ...env, "add", "f.txt");
+			g(sub, ...env, ...gitIdent, "commit", "-q", "-m", "two");
+			writeFileSync(join(sub, "f.txt"), "bravo\n");
+			return g(sub, ...env, "rev-parse", "HEAD");
+		};
+
+		const hostile = superCopy("super-hostile");
+		writeFileSync(join(hostile, ".gitmodules"), "\tignore = none\n", { flag: "a" });
+		const moved = moveAndDirty(hostile);
+		rmSync(marks, { force: true });
+		const hostilePin = pinned(hostile);
+		const seen = {
+			diff: workingDiff(hostilePin),
+			stat: diffStat(hostilePin),
+			tree: treeId(hostilePin),
+			tracked: trackedTreeId(hostilePin),
+			snapshot: snapshotTree(hostilePin),
+			patch: candidatePatch(hostilePin, "HEAD").toString("utf8"),
+		};
+		const hostileRan = ran();
+		check(
+			"no diff, stat, tree, snapshot or patch call starts git inside a hostile submodule",
+			hostileRan === "",
+			hostileRan,
+		);
+		const gitlink = `160000 commit ${moved}\tsub`;
+		check(
+			"a moved submodule pointer shows in the diff, stat, tree ids, snapshot and patch",
+			seen.diff.includes(`+Subproject commit ${moved}\n`) &&
+				/^ ?sub +\|/m.test(seen.stat) &&
+				[seen.tree, seen.tracked, seen.snapshot].every((rev) =>
+					g(hostile, "ls-tree", rev, "sub").includes(gitlink),
+				) &&
+				seen.patch.includes(`+Subproject commit ${moved}\n`),
+			JSON.stringify(seen),
+		);
+		check(
+			"a snapshot leaves the submodule's entry in the real index unchanged and unmarked",
+			g(hostile, "ls-files", "-t", "-s", "sub").startsWith("H 160000 ") &&
+				!g(hostile, "ls-files", "-s", "sub").includes(moved),
+		);
+		g(hostile, "-c", "core.fsmonitor=false", "diff");
+		g(hostile, "-c", "core.fsmonitor=false", "status");
+		check(
+			"the hostile submodule does run its commands under a plain git diff and status",
+			ran().includes("external") && ran().includes("clean"),
+			ran(),
+		);
+
+		const cases: Record<string, (repo: string) => void> = {
+			"unchanged but dirty submodule": (repo) => writeFileSync(join(repo, "sub", "f.txt"), "bravo\n"),
+			"moved pointer": (repo) => void moveAndDirty(repo),
+			"new regular file": (repo) => writeFileSync(join(repo, "fresh.txt"), "fresh\n"),
+			"empty uninitialized gitlink": (repo) => {
+				rmSync(join(repo, "sub"), { recursive: true });
+				mkdirSync(join(repo, "sub"));
+			},
+			"files under an uninitialized gitlink": (repo) => rmSync(join(repo, "sub", ".git"), { recursive: true }),
+			"deleted submodule dir": (repo) => rmSync(join(repo, "sub"), { recursive: true }),
+			"gitlink dir replaced by a symlink": (repo) => {
+				const aside = `${repo}-aside`;
+				rmSync(aside, { recursive: true, force: true });
+				renameSync(join(repo, "sub"), aside);
+				symlinkSync(aside, join(repo, "sub"));
+			},
+			"unmerged gitlink": (repo) => {
+				const recorded = g(repo, "rev-parse", "HEAD:sub");
+				const moved = moveAndDirty(repo);
+				const stages = [recorded, recorded, moved].map((sha, i) => `160000 ${sha} ${i + 1}\tsub\n`).join("");
+				execFileSync("git", ["update-index", "--index-info"], {
+					cwd: repo,
+					input: `0 ${"0".repeat(40)}\tsub\n${stages}`,
+				});
+			},
+			"sparse checkout with a materialized skipped file": (repo) => {
+				g(repo, "update-index", "--skip-worktree", "top.txt");
+				g(repo, "config", "core.sparseCheckout", "true");
+				writeFileSync(join(repo, ".git", "info", "sparse-checkout"), "/*\n");
+				writeFileSync(join(repo, "top.txt"), "changed\n");
+				moveAndDirty(repo);
+			},
+			"submodule with no commit checked out": (repo) => {
+				g(join(repo, "sub"), "symbolic-ref", "HEAD", "refs/heads/unborn");
+				writeFileSync(join(repo, "sub", "f.txt"), "bravo, longer\n");
+			},
+		};
+		const mismatched: string[] = [];
+		for (const [name, mutate] of Object.entries(cases)) {
+			for (const ignoreNone of [false, true]) {
+				const repo = superCopy("super-case");
+				if (ignoreNone) writeFileSync(join(repo, ".gitmodules"), "\tignore = none\n", { flag: "a" });
+				mutate(repo);
+				rmSync(marks, { force: true });
+				const pin = pinned(repo);
+				const ours = [treeId(pin), trackedTreeId(pin)];
+				const started = ran();
+				const plain = [plainTree(repo, "-A"), plainTree(repo, "-u")];
+				if (started !== "" || ours.join() !== plain.join()) {
+					mismatched.push(`${name} (ignore=none ${ignoreNone}): ran [${started}] ${ours} != ${plain}`);
+				}
+			}
+		}
+		check(
+			"tree ids match plain git add for every submodule state, without starting git inside one",
+			mismatched.length === 0,
+			mismatched.join("\n"),
+		);
+
+		const refusalsOf = (repo: string) =>
+			[treeId, trackedTreeId].map((snapshot) => {
+				try {
+					return snapshot(pinned(repo));
+				} catch (err) {
+					return (err as Error).message;
+				}
+			});
+
+		const unmergedUnborn = superCopy("super-unmerged-unborn");
+		cases["unmerged gitlink"]?.(unmergedUnborn);
+		g(join(unmergedUnborn, "sub"), "symbolic-ref", "HEAD", "refs/heads/unborn");
+		rmSync(marks, { force: true });
+		const unmergedRefusals = refusalsOf(unmergedUnborn);
+		check(
+			"a snapshot refuses an unmerged submodule with no commit checked out, without starting git inside it",
+			unmergedRefusals.every((message) => message.includes("Unable to mark file")) && ran() === "",
+			`${unmergedRefusals.join("\n")} ran [${ran()}]`,
+		);
+
+		const ignored = superCopy("super-ignore-all");
+		writeFileSync(join(ignored, ".gitmodules"), "\tignore = all\n", { flag: "a" });
+		const ignoredMove = moveAndDirty(ignored);
+		rmSync(marks, { force: true });
+		const ignoredTrees = [treeId(pinned(ignored)), trackedTreeId(pinned(ignored))];
+		const ignoredRan = ran();
+		check(
+			"a snapshot records the checked-out HEAD of a submodule marked ignore=all, unlike plain git add",
+			ignoredRan === "" &&
+				ignoredTrees.every((tree) => g(ignored, "ls-tree", tree, "sub").includes(ignoredMove)) &&
+				!g(ignored, "ls-tree", plainTree(ignored, "-A"), "sub").includes(ignoredMove),
+			`ran [${ignoredRan}] ${ignoredTrees}`,
+		);
+
+		const undecodable = superCopy("super-undecodable");
+		execFileSync("git", ["update-index", "--index-info"], {
+			cwd: undecodable,
+			input: Buffer.concat([
+				Buffer.from(`160000 ${g(undecodable, "rev-parse", "HEAD:sub")}\ts`),
+				Buffer.from([0xff, 0x0a]),
+			]),
+		});
+		const undecodableRefusals = refusalsOf(undecodable);
+		check(
+			"a snapshot refuses a submodule path that is not valid UTF-8",
+			undecodableRefusals.every((message) => message.includes("not valid UTF-8")),
+			undecodableRefusals.join("\n"),
+		);
+
+		const nesting = superCopy("super-nesting");
+		const nestingPin = pinned(nesting);
+		const nestingBase = snapshotTree(nestingPin);
+		const nestingWorker = addCandidateWorktree(nestingPin, join(root, "nesting-ledger"), 1, 1, nestingBase);
+		/** A repository a worker could create by writing only its own work tree, armed to run commands. */
+		const plantNested = (tree: string) => {
+			const dir = join(tree, "planted-repo");
+			mkdirSync(dir);
+			g(dir, "init", "-q");
+			writeFileSync(join(dir, "f.txt"), "alpha\n");
+			commitAll(dir, "one");
+			writeFileSync(join(dir, ".git", "info", "attributes"), "* filter=trap\n");
+			g(dir, "config", "core.fsmonitor", trap("nested-fsmonitor", "true"));
+			g(dir, "config", "filter.trap.clean", trap("nested-clean", "cat"));
+			writeFileSync(join(dir, "f.txt"), "bravo\n");
+			return dir;
+		};
+		const nestedDirs = [plantNested(nesting), plantNested(nestingWorker.workTree)];
+		rmSync(marks, { force: true });
+		workingDiff(nestingPin);
+		diffStat(nestingPin);
+		treeId(nestingPin);
+		trackedTreeId(nestingPin);
+		snapshotTree(nestingPin);
+		candidatePatch(nestingWorker, nestingBase);
+		const nestedRan = ran();
+		check(
+			"no git.ts call starts git inside an untracked nested repository planted in a work tree",
+			nestedRan === "",
+			nestedRan,
+		);
+		for (const dir of nestedDirs) g(dir, "status");
+		check(
+			"the planted nested repository does run its commands under plain git status",
+			ran().includes("nested-fsmonitor") && ran().includes("nested-clean"),
+			ran(),
+		);
+		removeCandidateWorktree(nestingPin, nestingWorker);
+
+		const armed = join(root, "repo-armed");
+		const armedLedger = join(root, "armed-ledger");
+		const armedFiles = ["plain.txt", "driven.drv", "filtered.flt"];
+		const writeArmed = (dir: string, text: string) => {
+			for (const file of armedFiles) writeFileSync(join(dir, file), text);
+		};
+		mkdirSync(armed, { recursive: true });
+		g(armed, "init", "-q");
+		writeArmed(armed, "one\n");
+		commitAll(armed, "base");
+		writeFileSync(join(armed, ".git", "info", "attributes"), "*.drv diff=trap\n*.flt filter=trap\n");
+		const events = [
+			"applypatch-msg",
+			"pre-applypatch",
+			"post-applypatch",
+			"pre-commit",
+			"pre-merge-commit",
+			"prepare-commit-msg",
+			"commit-msg",
+			"post-commit",
+			"pre-rebase",
+			"post-checkout",
+			"post-merge",
+			"pre-push",
+			"pre-receive",
+			"update",
+			"proc-receive",
+			"post-receive",
+			"post-update",
+			"reference-transaction",
+			"push-to-checkout",
+			"pre-auto-gc",
+			"post-rewrite",
+			"sendemail-validate",
+			"fsmonitor-watchman",
+			"p4-changelist",
+			"p4-prepare-changelist",
+			"p4-post-changelist",
+			"p4-pre-submit",
+			"post-index-change",
+		];
+		const dirEvents = events.filter((event) => event !== "post-checkout");
+		mkdirSync(join(armed, ".git", "hooks"), { recursive: true });
+		for (const event of events) {
+			g(armed, "config", `hook.trap-${event}.event`, event);
+			g(armed, "config", `hook.trap-${event}.command`, trap(`config-${event}`, "true"));
+		}
+		for (const event of dirEvents) {
+			const script = `#!/bin/sh\n${trap(`dir-${event}`, "true")}\n`;
+			writeFileSync(join(armed, ".git", "hooks", event), script, { mode: 0o755 });
+		}
+		for (const [key, name, then] of [
+			["core.fsmonitor", "fsmonitor", "true"],
+			["diff.external", "external", "true"],
+			["diff.trap.command", "driver", "true"],
+			["filter.trap.clean", "clean", "cat"],
+			["filter.trap.smudge", "smudge", "cat"],
+		] as const) {
+			g(armed, "config", key, trap(name, then));
+		}
+		writeArmed(armed, "second\n");
+
+		const fired: string[] = [];
+		const filtersRan = new Set<string>();
+		const watched = <T>(call: string, run: () => T): T => {
+			rmSync(marks, { force: true });
+			const value = run();
+			for (const name of ran().split("\n").filter(Boolean)) {
+				if (name === "clean" || name === "smudge") filtersRan.add(name);
+				else fired.push(`${call}: ${name}`);
+			}
+			return value;
+		};
+		const armedPin = watched("pinRepo", () => pinned(armed));
+		const armedDiff = watched("workingDiff", () => workingDiff(armedPin));
+		const armedStat = watched("diffStat", () => diffStat(armedPin));
+		const armedTree = watched("treeId", () => treeId(armedPin));
+		const armedTracked = watched("trackedTreeId", () => trackedTreeId(armedPin));
+		const armedSnapshot = watched("snapshotTree", () => snapshotTree(armedPin));
+		const armedCommitTree = watched("treeId of a commit", () => treeId(armedPin, armedSnapshot));
+		const armedHead = watched("headInfo", () => headInfo(armedPin));
+		const worker = watched("addCandidateWorktree", () =>
+			addCandidateWorktree(armedPin, armedLedger, 1, 1, armedSnapshot),
+		);
+		writeArmed(worker.workTree, "three\n");
+		const armedPatch = watched("candidatePatch", () => candidatePatch(worker, armedSnapshot));
+		const contents = () => armedFiles.map((file) => readFileSync(join(armed, file), "utf8")).join("");
+		watched("applyPatch", () => applyPatch(armedPin, armedPatch));
+		const afterApply = contents();
+		watched("revertPatch", () => revertPatch(armedPin, armedPatch));
+		const afterRevert = contents();
+		watched("removeCandidateWorktree", () => removeCandidateWorktree(armedPin, worker));
+		const doomed = addCandidateWorktree(armedPin, armedLedger, 1, 2, armedSnapshot);
+		g(armed, "worktree", "unlock", doomed.workTree);
+		g(armed, "worktree", "lock", "--reason", `ledgerpi:${await deadPid()}`, doomed.workTree);
+		const armedPruned = watched("pruneStaleCandidates", () => pruneStaleCandidates(armedPin, armedLedger));
+		check(
+			"no git.ts call runs fsmonitor, a diff command or a hook set in the repository",
+			fired.length === 0,
+			fired.join("\n"),
+		);
+		check(
+			"every git.ts call still does its work under that configuration",
+			armedDiff.includes("+second") &&
+				armedStat.includes("plain.txt") &&
+				armedTree === armedCommitTree &&
+				armedTracked === armedTree &&
+				armedHead.sha !== null &&
+				afterApply === "three\n".repeat(armedFiles.length) &&
+				afterRevert === "second\n".repeat(armedFiles.length) &&
+				!existsSync(worker.workTree) &&
+				armedPruned.join() === doomed.workTree &&
+				!existsSync(doomed.workTree),
+			JSON.stringify({ armedDiff, armedStat, armedHead, afterApply, afterRevert, armedPruned }),
+		);
+		check(
+			"configured clean and smudge filters still run",
+			filtersRan.has("clean") && filtersRan.has("smudge"),
+			[...filtersRan].join(),
+		);
+
+		const configHooksSupported =
+			spawnSync(
+				"git",
+				["-c", "hook.probe.command=true", "-c", "hook.probe.event=pre-commit", "hook", "list", "pre-commit"],
+				{ cwd: armed },
+			).status === 0;
+		rmSync(marks, { force: true });
+		g(armed, "status");
+		g(armed, "diff");
+		for (const event of events) g(armed, "hook", "run", "--ignore-missing", event);
+		const plainRan = new Set(ran().split("\n"));
+		const unsprung = [
+			"fsmonitor",
+			"external",
+			"driver",
+			...dirEvents.map((event) => `dir-${event}`),
+			...(configHooksSupported ? events.map((event) => `config-${event}`) : []),
+		].filter((name) => !plainRan.has(name));
+		check("each of those commands and hooks does run under plain git", unsprung.length === 0, unsprung.join());
+
+		const redirected = join(root, "repo-redirect");
+		const redirectLedger = join(root, "redirect-ledger");
+		const planted = join(root, "planted");
+		const beyond = join(root, "beyond");
+		for (const dir of [redirected, planted, beyond]) mkdirSync(dir, { recursive: true });
+		g(redirected, "init", "-q");
+		writeFileSync(join(redirected, "real.txt"), "one\n");
+		commitAll(redirected, "base");
+		g(planted, "init", "-q");
+		writeFileSync(join(planted, "bait.txt"), "bait\n");
+		commitAll(planted, "bait");
+		writeFileSync(join(beyond, "secret.txt"), "outside content\n");
+		g(planted, "config", "core.worktree", beyond);
+		g(planted, "config", "core.fsmonitor", trap("planted-fsmonitor", "true"));
+		const redirectPin = pinned(redirected);
+		const redirectBase = snapshotTree(redirectPin);
+		const turncoat = addCandidateWorktree(redirectPin, redirectLedger, 1, 1, redirectBase);
+		writeFileSync(join(turncoat.workTree, ".git"), `gitdir: ${join(planted, ".git")}\n`);
+		writeFileSync(join(turncoat.workTree, "real.txt"), "one\ntwo\n");
+		writeFileSync(join(turncoat.workTree, "made.txt"), "made by the worker\n");
+		rmSync(marks, { force: true });
+		const redirectPatch = candidatePatch(turncoat, redirectBase).toString("utf8");
+		const redirectRan = ran();
+		check(
+			"candidatePatch ignores a rewritten candidate .git and carries the real changes",
+			redirectRan === "" &&
+				redirectPatch.includes("+two\n") &&
+				redirectPatch.includes("+made by the worker\n") &&
+				!redirectPatch.includes("secret.txt") &&
+				!redirectPatch.includes("bait.txt"),
+			`${redirectRan}\n${redirectPatch}`,
+		);
+		g(turncoat.workTree, "status");
+		check("the planted git dir does run its fsmonitor under plain git", ran().includes("planted-fsmonitor"), ran());
+		removeCandidateWorktree(redirectPin, turncoat);
+
+		/** Two candidates, the first with its `.git` file pointed at the second's administrative directory. */
+		const crossed = (iter: number) => {
+			const victim = addCandidateWorktree(redirectPin, redirectLedger, iter, 1, redirectBase);
+			const sibling = addCandidateWorktree(redirectPin, redirectLedger, iter, 2, redirectBase);
+			writeFileSync(join(victim.workTree, ".git"), `gitdir: ${sibling.gitDir}\n`);
+			const sprung = g(victim.workTree, "rev-parse", "--absolute-git-dir") === sibling.gitDir;
+			return { victim, sibling, sprung };
+		};
+		const onlyVictimGone = ({ victim, sibling, sprung }: ReturnType<typeof crossed>) => {
+			const list = g(redirected, "worktree", "list", "--porcelain").split("\n");
+			return (
+				sprung &&
+				existsSync(sibling.gitDir) &&
+				list.includes(`worktree ${sibling.workTree}`) &&
+				!existsSync(victim.gitDir) &&
+				!existsSync(victim.workTree) &&
+				!list.includes(`worktree ${victim.workTree}`)
+			);
+		};
+		const removal = crossed(2);
+		removeCandidateWorktree(redirectPin, removal.victim);
+		check(
+			"removeCandidateWorktree removes its own metadata when .git names a sibling's, which survives",
+			onlyVictimGone(removal),
+			g(redirected, "worktree", "list", "--porcelain"),
+		);
+		removeCandidateWorktree(redirectPin, removal.sibling);
+
+		const leftover = crossed(3);
+		g(redirected, "worktree", "unlock", leftover.victim.workTree);
+		g(redirected, "worktree", "lock", "--reason", `ledgerpi:${await deadPid()}`, leftover.victim.workTree);
+		const leftoverPruned = pruneStaleCandidates(redirectPin, redirectLedger);
+		check(
+			"pruneStaleCandidates removes a dead candidate's own metadata when .git names a sibling's, which survives",
+			leftoverPruned.join() === leftover.victim.workTree && onlyVictimGone(leftover),
+			`${JSON.stringify(leftoverPruned)}\n${g(redirected, "worktree", "list", "--porcelain")}`,
+		);
+		removeCandidateWorktree(redirectPin, leftover.sibling);
+
+		const linkedRun = join(root, "linked-run");
+		g(redirected, "worktree", "add", "-q", "-b", "side", linkedRun);
+		writeFileSync(join(linkedRun, "side.txt"), "side\n");
+		commitAll(linkedRun, "side");
+		writeFileSync(join(linkedRun, "real.txt"), "one\nlinked edit\n");
+		writeFileSync(join(linkedRun, "fresh.txt"), "fresh\n");
+		const linkedPin = pinned(linkedRun);
+		const linkedHead = g(linkedRun, "rev-parse", "HEAD");
+		const linkedPlain = [plainTree(linkedRun, "-A"), plainTree(linkedRun, "-u")];
+		writeFileSync(join(linkedRun, ".git"), `gitdir: ${join(planted, ".git")}\n`);
+		rmSync(marks, { force: true });
+		const linkedSeen = {
+			diff: workingDiff(linkedPin),
+			stat: diffStat(linkedPin),
+			tree: treeId(linkedPin),
+			tracked: trackedTreeId(linkedPin),
+			snapshot: snapshotTree(linkedPin),
+			head: headInfo(linkedPin),
+		};
+		const linkedRan = ran();
+		check(
+			"a linked-worktree run dir's .git rewritten after pinning runs nothing from the planted git dir",
+			linkedRan === "",
+			linkedRan,
+		);
+		check(
+			"after that rewrite the pinned calls still read the real work tree, index and HEAD",
+			linkedSeen.diff.includes("+linked edit") &&
+				linkedSeen.diff.includes("fresh.txt") &&
+				linkedSeen.stat.includes("real.txt") &&
+				isDeepStrictEqual([linkedSeen.tree, linkedSeen.tracked], linkedPlain) &&
+				g(redirected, "rev-parse", `${linkedSeen.snapshot}^{tree}`) === linkedPlain[0] &&
+				g(redirected, "rev-parse", `${linkedSeen.snapshot}^`) === linkedHead &&
+				linkedSeen.head.branch === "side" &&
+				linkedSeen.head.sha === linkedHead,
+			JSON.stringify({ ...linkedSeen, linkedPlain, linkedHead }),
+		);
+		const followed = g(linkedRun, "rev-parse", "--absolute-git-dir");
+		g(linkedRun, "status");
+		check(
+			"plain git in that run dir follows the rewritten .git and runs the planted fsmonitor",
+			followed === join(planted, ".git") && ran().includes("planted-fsmonitor"),
+			`${followed}\n${ran()}`,
+		);
+
+		const pins = join(realpathSync(root), "pins");
+		const top = join(pins, "top");
+		const nested = join(top, "a", "b");
+		mkdirSync(nested, { recursive: true });
+		g(top, "init", "-q");
+		commitAll(top, "base");
+		const isPin = (cwd: string, workTree: string, gitDir: string, commonDir: string) =>
+			isDeepStrictEqual(pinRepo(cwd), { workTree, gitDir, commonDir });
+		const pinsOf = (...cwds: string[]) => JSON.stringify(cwds.map((cwd) => pinRepo(cwd)));
+
+		const missing = join(pins, "missing");
+		check("pinRepo is null for a cwd that does not exist", pinRepo(missing) === null, pinsOf(missing));
+
+		const loose = join(pins, "loose");
+		mkdirSync(loose);
+		check("pinRepo is null outside any repository", pinRepo(loose) === null, pinsOf(loose));
+
+		const bare = join(pins, "bare.git");
+		g(pins, "init", "-q", "--bare", bare);
+		const insideGitDir = [join(top, ".git"), join(top, ".git", "refs")];
+		check(
+			"pinRepo is null for a bare repository and for a cwd inside a git dir",
+			[bare, ...insideGitDir].every((cwd) => pinRepo(cwd) === null),
+			pinsOf(bare, ...insideGitDir),
+		);
+
+		const brokenLink = join(top, "broken-link");
+		mkdirSync(brokenLink);
+		const enclosed = pinRepo(brokenLink)?.workTree === top;
+		writeFileSync(join(brokenLink, ".git"), `gitdir: ${missing}\n`);
+		const unreadable = [brokenLink];
+		for (const [name, settings] of [
+			["future-format", [["core.repositoryformatversion", "99"]]],
+			[
+				"unknown-extension",
+				[
+					["core.repositoryformatversion", "1"],
+					["extensions.unheardof", "true"],
+				],
+			],
+		] as const) {
+			const refused = join(pins, name);
+			mkdirSync(refused);
+			g(refused, "init", "-q");
+			for (const [key, value] of settings) g(refused, "config", "--file", join(".git", "config"), key, value);
+			unreadable.push(refused);
+		}
+		check(
+			"pinRepo is null for a repository git refuses: a broken gitfile, an unknown format or extension",
+			enclosed && unreadable.every((cwd) => pinRepo(cwd) === null),
+			pinsOf(...unreadable),
+		);
+
+		const dotGit = join(top, ".git");
+		const alias = join(pins, "alias");
+		symlinkSync(nested, alias);
+		check(
+			"pinRepo pins a work tree's top, a subdir and a symlink to a subdir to <top>/.git",
+			[top, nested, alias].every((cwd) => isPin(cwd, top, dotGit, dotGit)),
+			pinsOf(top, nested, alias),
+		);
+
+		const linked = join(pins, "linked");
+		g(top, "worktree", "add", "-q", "--detach", linked);
+		mkdirSync(join(linked, "inside"));
+		check(
+			"pinRepo pins a linked worktree to its admin dir under the main repository's git dir",
+			[linked, join(linked, "inside")].every((cwd) =>
+				isPin(cwd, linked, join(dotGit, "worktrees", "linked"), dotGit),
+			),
+			pinsOf(linked, join(linked, "inside")),
+		);
+
+		const superproject = join(pins, "superproject");
+		mkdirSync(superproject);
+		g(superproject, "init", "-q");
+		g(superproject, "-c", "protocol.file.allow=always", "submodule", "--quiet", "add", top, "mod");
+		const checkout = join(superproject, "mod");
+		const moduleDir = join(superproject, ".git", "modules", "mod");
+		check(
+			"pinRepo pins a submodule checkout to its git dir under the superproject",
+			isPin(checkout, checkout, moduleDir, moduleDir),
+			pinsOf(checkout),
+		);
+
+		/** One candidate's whole life from `cwd`: create, patch, apply, revert, then prune it as a dead owner's. */
+		const candidateLife = async (cwd: string, name: string) => {
+			const pin = pinned(cwd);
+			const ledger = join(pins, `${name}-ledger`);
+			const base = snapshotTree(pin);
+			const before = treeId(pin);
+			const candidate = addCandidateWorktree(pin, ledger, 1, 1, base);
+			writeFileSync(join(candidate.workTree, "from-candidate.txt"), "made\n");
+			const patch = candidatePatch(candidate, base);
+			applyPatch(pin, patch);
+			const applied = readFileSync(join(cwd, "from-candidate.txt"), "utf8");
+			revertPatch(pin, patch);
+			const reverted = !existsSync(join(cwd, "from-candidate.txt")) && treeId(pin) === before;
+			g(cwd, "worktree", "unlock", candidate.workTree);
+			g(cwd, "worktree", "lock", "--reason", `ledgerpi:${await deadPid()}`, candidate.workTree);
+			const pruned = pruneStaleCandidates(pin, ledger);
+			return {
+				applied,
+				reverted,
+				pruned: pruned.join() === candidate.workTree,
+				gone: !existsSync(candidate.workTree) && !existsSync(candidate.gitDir),
+			};
+		};
+		const worked = { applied: "made\n", reverted: true, pruned: true, gone: true };
+		for (const [kind, cwd] of [
+			["linked worktree", linked],
+			["submodule checkout", checkout],
+		] as const) {
+			const life = await candidateLife(cwd, kind.replace(" ", "-"));
+			check(
+				`a candidate is created, applied, reverted and pruned from a ${kind} run dir`,
+				isDeepStrictEqual(life, worked),
+				JSON.stringify(life),
+			);
+		}
+
+		const fresh = join(pins, "fresh");
+		const freshSub = join(fresh, "sub", "dir");
+		mkdirSync(freshSub, { recursive: true });
+		g(fresh, "init", "-q");
+		writeFileSync(join(freshSub, "first.txt"), "first\n");
+		const freshPin = pinned(freshSub);
+		const freshHead = headInfo(freshPin);
+		const freshSnapshot = snapshotTree(freshPin);
+		check(
+			"pinRepo pins an unborn repository from a subdir, with a null sha and a parentless snapshot",
+			isPin(freshSub, fresh, join(fresh, ".git"), join(fresh, ".git")) &&
+				freshHead.sha === null &&
+				g(fresh, "rev-list", "--parents", freshSnapshot) === freshSnapshot &&
+				g(fresh, "show", `${freshSnapshot}:sub/dir/first.txt`) === "first",
+			`${pinsOf(freshSub)} ${JSON.stringify(freshHead)}`,
+		);
+
+		const brokenName = join(pins, "line\nbreak");
+		mkdirSync(brokenName, { recursive: true });
+		g(brokenName, "init", "-q");
+		check(
+			"pinRepo is null when git's answer does not split into three paths",
+			pinRepo(brokenName) === null,
+			pinsOf(brokenName),
+		);
+
+		g(top, "config", "worktree.useRelativePaths", "true");
+		const relativeLedger = join(pins, "relative-ledger");
+		const [relative, neighbor] = [1, 2].map((index) =>
+			addCandidateWorktree(pinned(top), relativeLedger, 1, index, "HEAD"),
+		);
+		const relativePathsSupported = spawnSync("git", ["worktree", "add", "-h"], { encoding: "utf8" }).stdout.includes(
+			"relative-paths",
+		);
+		const recorded = readFileSync(join(relative.gitDir, "gitdir"), "utf8").trim();
+		const ownAdminDir = g(relative.workTree, "rev-parse", "--absolute-git-dir");
+		check(
+			"addCandidateWorktree pins a candidate's own admin dir when worktree paths are recorded relative",
+			(!relativePathsSupported || !isAbsolute(recorded)) &&
+				relative.gitDir === ownAdminDir &&
+				relative.gitDir !== neighbor.gitDir &&
+				relative.commonDir === dotGit,
+			JSON.stringify({ relative, neighbor, recorded, ownAdminDir }),
+		);
+		removeCandidateWorktree(pinned(top), relative);
+		check(
+			"removeCandidateWorktree removes a relative-path candidate's work tree and admin dir only",
+			!existsSync(relative.workTree) && !existsSync(relative.gitDir) && existsSync(neighbor.gitDir),
+			g(top, "worktree", "list", "--porcelain"),
+		);
+		removeCandidateWorktree(pinned(top), neighbor);
 	}
 
 	// --- ledger_solve tool: a pinned [roleModel] entry drives both roles ---

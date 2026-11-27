@@ -5,7 +5,7 @@ import type { LedgerpiConfig } from "../../packages/core/src/config.ts";
 import { disabledByEnv, inScope, modelRef, roleModelsFor, scopeReason } from "../../packages/core/src/config.ts";
 import { readPlanFile } from "../../packages/core/src/files.ts";
 import { detectGate } from "../../packages/core/src/gate.ts";
-import { headInfo, isGitRepo } from "../../packages/core/src/git.ts";
+import { headInfo, pinRepo } from "../../packages/core/src/git.ts";
 import { handoffBlock } from "../../packages/core/src/handoff.ts";
 import type { WorkflowMutex } from "./mutex.ts";
 import { ensureReady, recordRun, runLedger, type SessionState } from "./runner.ts";
@@ -134,7 +134,8 @@ export function ledgerSolveTool(deps: ToolDeps) {
 				);
 			}
 			const cwd = params.cwd?.trim() || ctx.cwd;
-			if (!isGitRepo(cwd)) return punt(`\`${cwd}\` is not a git repository.`);
+			const repo = pinRepo(cwd);
+			if (repo === null) return punt(`\`${cwd}\` is not a git repository.`);
 			const task = params.task?.trim();
 			if (!task) return punt("No task was provided.");
 			const planPath = params.plan_file?.trim();
@@ -164,13 +165,14 @@ export function ledgerSolveTool(deps: ToolDeps) {
 				try {
 					const gateCommand = params.gate?.trim() || detectGate(deps.cfg, cwd);
 					const startedAt = Date.now();
-					const headStart = headInfo(cwd);
+					const headStart = headInfo(repo);
 					const roles = roleModelsFor(deps.cfg, provider, modelId);
 					const result = await runLedger(
 						deps.events,
 						deps.cfg,
 						ctx,
 						cwd,
+						repo,
 						task,
 						gateCommand,
 						{
@@ -193,10 +195,10 @@ export function ledgerSolveTool(deps: ToolDeps) {
 						classified: null,
 						calls: run.calls,
 						tokens: run.tokens,
-						git: { start: headStart, end: headInfo(cwd) },
+						git: { start: headStart, end: headInfo(repo) },
 					});
 					if (result.stop === "aborted") return text("The ledger loop was aborted before completing.");
-					return text(handoffBlock(cwd, result));
+					return text(handoffBlock(repo, result));
 				} finally {
 					deps.mutex.release();
 				}

@@ -13,7 +13,7 @@ import {
 	scopeReason,
 } from "../../packages/core/src/config.ts";
 import { detectGate } from "../../packages/core/src/gate.ts";
-import { headInfo, isGitRepo, isInWorkTree } from "../../packages/core/src/git.ts";
+import { headInfo, isGitRepo, isInWorkTree, pinRepo, type RepoPin } from "../../packages/core/src/git.ts";
 import { handoffBlock } from "../../packages/core/src/handoff.ts";
 import type { LoopResult } from "../../packages/core/src/loop.ts";
 import { bindUISink, releaseUISink, report, uiSinkBound } from "../../packages/core/src/report.ts";
@@ -212,6 +212,7 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const runAndAudit = async (
 		ctx: ExtensionContext,
+		repo: RepoPin,
 		entry: "input" | "command",
 		task: string,
 		gateCommand: string | undefined,
@@ -251,13 +252,14 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			const startedAt = Date.now();
-			const headStart = headInfo(where.cwd);
+			const headStart = headInfo(repo);
 			const roles = roleModelsFor(cfg, model.provider, model.model);
 			const result = await runLedger(
 				pi.events,
 				cfg,
 				ctx,
 				ctx.cwd,
+				repo,
 				task,
 				gateCommand,
 				{
@@ -286,7 +288,7 @@ export default function (pi: ExtensionAPI) {
 				classified: extra.classified,
 				calls: run.calls,
 				tokens: run.tokens,
-				git: { start: headStart, end: headInfo(where.cwd) },
+				git: { start: headStart, end: headInfo(repo) },
 			});
 			return result;
 		} finally {
@@ -351,7 +353,8 @@ export default function (pi: ExtensionAPI) {
 		const provider = ctx.model?.provider;
 		const modelId = ctx.model?.id;
 		if (!inScope(cfg, provider, modelId)) return dbg(`bail: ${provider}/${modelId} not in scope`);
-		if (!isGitRepo(ctx.cwd)) return dbg("bail: not a git repo");
+		const repo = pinRepo(ctx.cwd);
+		if (repo === null) return dbg("bail: not a git repo");
 		// A prompt the trigger keeps out of the loop still claims the turn, as the chat
 		// and decline paths do, so before_agent_start never arms the edit redirect and
 		// pulls it into the loop anyway.
@@ -402,6 +405,7 @@ export default function (pi: ExtensionAPI) {
 			// handler was in readiness, classification, or the ask dialog.
 			const result = await runAndAudit(
 				ctx,
+				repo,
 				"input",
 				trimmed,
 				gateCommand,
@@ -424,7 +428,7 @@ export default function (pi: ExtensionAPI) {
 				return { action: "handled" as const };
 			}
 
-			return { action: "transform" as const, text: text + handoffBlock(ctx.cwd, result) };
+			return { action: "transform" as const, text: text + handoffBlock(repo, result) };
 		} catch (err) {
 			// Any unexpected failure falls back to a normal turn. ledgerpi must never
 			// make a turn worse than not being installed.
@@ -569,7 +573,8 @@ export default function (pi: ExtensionAPI) {
 				if (!inScope(cfg, provider, modelId)) {
 					return say(`ledgerpi: not active for ${provider ?? "?"}/${modelId ?? "?"} (see /ledgerpi).`);
 				}
-				if (!isGitRepo(ctx.cwd)) return say(`ledgerpi: ${ctx.cwd} is not a git repository.`);
+				const repo = pinRepo(ctx.cwd);
+				if (repo === null) return say(`ledgerpi: ${ctx.cwd} is not a git repository.`);
 				if (!(await ensureReady(pi.events, state, READY_TIMEOUT_MS))) {
 					return say("ledgerpi: the pi-subagents RPC is unavailable in this session.");
 				}
@@ -577,6 +582,7 @@ export default function (pi: ExtensionAPI) {
 					const gateCommand = detectGate(cfg, ctx.cwd);
 					const result = await runAndAudit(
 						ctx,
+						repo,
 						"command",
 						task,
 						gateCommand,
@@ -593,7 +599,7 @@ export default function (pi: ExtensionAPI) {
 						return say("ledgerpi: the ledger loop was aborted before completing.");
 					}
 					if (!ctx.hasUI) {
-						console.error(handoffBlock(ctx.cwd, result).trimStart());
+						console.error(handoffBlock(repo, result).trimStart());
 						return;
 					}
 					await ctx.waitForIdle();
@@ -602,7 +608,7 @@ export default function (pi: ExtensionAPI) {
 					// push the verifying model back into ledger_solve. Claimed only once idle,
 					// so the flag cannot be consumed by a turn that was already running.
 					state.turnOwnedByInputHook = true;
-					pi.sendUserMessage(task + handoffBlock(ctx.cwd, result));
+					pi.sendUserMessage(task + handoffBlock(repo, result));
 				} catch (err) {
 					say(`ledgerpi: the ledger loop failed: ${(err as Error).message}`, "error");
 				}

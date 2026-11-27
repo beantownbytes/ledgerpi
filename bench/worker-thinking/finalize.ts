@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { runGate } from "../../packages/core/src/gate.ts";
-import { diffStat } from "../../packages/core/src/git.ts";
+import { diffStat, pinRepo } from "../../packages/core/src/git.ts";
 import {
 	type AuditRow,
 	attachSessionFailures,
@@ -119,7 +119,9 @@ const verifyTree = async (): Promise<FinalGate> => {
 		git(["reset", "--mixed", "--quiet", base]);
 		git(["add", "--intent-to-add", "."]);
 		writeFileSync(join(dir, "diff.patch"), git(["diff"]));
-		writeFileSync(join(dir, "diffstat.txt"), diffStat(repo));
+		const pin = pinRepo(repo);
+		if (pin === null) throw new Error(`${repo} is not inside a git work tree`);
+		writeFileSync(join(dir, "diffstat.txt"), diffStat(pin));
 	}
 	const timedOut = verdict.output?.endsWith(GATE_TIMED_OUT) ?? false;
 	return { ran: verdict.ran && !timedOut, passed: verdict.passed };

@@ -3,7 +3,7 @@ import { type AuditMeta, auditRun } from "./audit.ts";
 import { asFanoutSetting, type LedgerpiConfig } from "./config.ts";
 import { readPlanFile } from "./files.ts";
 import { detectGate, type GateRunner } from "./gate.ts";
-import { headInfo, isGitRepo, workTreeRoot } from "./git.ts";
+import { headInfo, pinRepo } from "./git.ts";
 import { handoffBlock } from "./handoff.ts";
 import { Ledger } from "./ledger.ts";
 import { acquireLock, type LockHolder, lockHolder } from "./lock.ts";
@@ -164,8 +164,8 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 		if (host.signal.aborted) return { kind: "canceled" };
 		if (problem !== null) return { kind: "rejected", ...problem };
 	}
-	const root = isGitRepo(args.cwd) ? workTreeRoot(args.cwd) : null;
-	if (root === null) return reject("not-git", `\`${args.cwd}\` is not a git repository.`, "cwd");
+	const repo = pinRepo(args.cwd);
+	if (repo === null) return reject("not-git", `\`${args.cwd}\` is not a git repository.`, "cwd");
 	if (host.checkTree) {
 		const problem = await host.checkTree();
 		if (host.signal.aborted) return { kind: "canceled" };
@@ -197,6 +197,7 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 	}
 	if (host.signal.aborted) return { kind: "canceled" };
 	// A dsh run lives inside the dsh server, so stopping it must not signal that process.
+	const root = repo.workTree;
 	const release = acquireLock(cfg.stateDir, root, { sharedProcess: host.harness === "dsh" });
 	if (release === null) return { kind: "busy", root, holder: readableHolder(cfg.stateDir, root) };
 
@@ -204,12 +205,13 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 		const ledger = new Ledger(cfg, args.session, `${Date.now()}-${randomUUID().slice(0, 8)}`);
 		const { spawn, tally } = host.spawner(ledger);
 		const startedAt = Date.now();
-		const headStart = headInfo(args.cwd);
+		const headStart = headInfo(repo);
 		const looped = await runLoop({
 			spawn,
 			cfg,
 			ledger,
 			cwd: args.cwd,
+			repo,
 			task,
 			gateCommand,
 			runGate: host.runGate,
@@ -249,7 +251,7 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 				classified: null,
 				calls: result.calls,
 				tokens: result.tokens,
-				git: { start: headStart, end: headInfo(args.cwd) },
+				git: { start: headStart, end: headInfo(repo) },
 				roleTokens: tally.tokens,
 			},
 		);
@@ -257,9 +259,7 @@ export async function solveTask(cfg: LedgerpiConfig, args: SolveArgs, host: Solv
 			kind: "ran",
 			result,
 			handoff:
-				result.stop === "aborted"
-					? ABORTED_HANDOFF
-					: [handoffBlock(args.cwd, result), ...result.mismatches].join("\n"),
+				result.stop === "aborted" ? ABORTED_HANDOFF : [handoffBlock(repo, result), ...result.mismatches].join("\n"),
 		};
 	} finally {
 		release();
